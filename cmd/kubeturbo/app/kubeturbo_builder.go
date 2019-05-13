@@ -6,78 +6,96 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
+	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	apiv1 "k8s.io/client-go/pkg/api/v1"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 
 	kubeturbo "github.com/turbonomic/kubeturbo/pkg"
-	"github.com/turbonomic/kubeturbo/pkg/action/executor"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/k8sconntrack"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/kubelet"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/master"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
-	"github.com/turbonomic/kubeturbo/pkg/turbostore"
 	"github.com/turbonomic/kubeturbo/test/flag"
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
+	"github.com/turbonomic/kubeturbo/pkg/kubeclient"
 )
 
 const (
 	// The default port for vmt service server
-	KubeturboPort   = 10265
-	K8sCadvisorPort = 4194
+	KubeturboPort               = 10265
+	DefaultKubeletPort          = 10255
+	DefaultKubeletHttps         = false
+	defaultVMPriority           = -1
+	defaultVMIsBase             = true
+	defaultDiscoveryIntervalSec = 600
+	defaultValidationWorkers    = 10
+	defaultValidationTimeout    = 60
 )
+
+var (
+	defaultSccSupport = []string{"restricted"}
+
+	//these variables will be deprecated. Keep it here for backward compatibility only
+	k8sVersion        = "1.8"
+	noneSchedulerName = "turbo-no-scheduler"
+)
+
+type disconnectFromTurboFunc func()
 
 // VMTServer has all the context and params needed to run a Scheduler
 // TODO: leaderElection is disabled now because of dependency problems.
 type VMTServer struct {
-	Port            int
-	Address         string
-	Master          string
-	K8sTAPSpec      string
-	TestingFlagPath string
-	KubeConfig      string
-	BindPodsQPS     float32
-	BindPodsBurst   int
-	CAdvisorPort    int
+	Port                 int
+	Address              string
+	Master               string
+	K8sTAPSpec           string
+	TestingFlagPath      string
+	KubeConfig           string
+	BindPodsQPS          float32
+	BindPodsBurst        int
+	DiscoveryIntervalSec int
 
 	//LeaderElection componentconfig.LeaderElectionConfiguration
 
 	EnableProfiling bool
 
-	// If the underlying infrastructure is VMWare, we cannot reply on IP address for stitching. Instead we use the
-	// systemUUID of each node, which is equal to UUID of corresponding VM discovered by VM probe.
-	// The default value is false.
-	UseVMWare bool
+	// To stitch the Nodes in Kubernetes cluster with the VM from the underlying cloud or
+	// hypervisor infrastructure: either use VM UUID or VM IP.
+	// If the underlying infrastructure is VMWare, AWS instances, or Azure instances, VM's UUID is used.
+	UseUUID bool
+
+	//VMPriority: priority of VM in supplyChain definition from kubeturbo, should be less than 0;
+	VMPriority int32
+	//VMIsBase: Is VM is the base template from kubeturbo, when stitching with other VM probes, should be false;
+	VMIsBase bool
 
 	// Kubelet related config
 	KubeletPort        int
 	EnableKubeletHttps bool
 
-	// for Move Action
-	K8sVersion        string
-	NoneSchedulerName string
+	// The cluster processor related config
+	ValidationWorkers int
+	ValidationTimeout int
 
-	// Flag for supporting non-disruptive action
-	enableNonDisruptiveSupport bool
+	// The Openshift SCC list allowed for action execution
+	sccSupport []string
 }
 
 // NewVMTServer creates a new VMTServer with default parameters
 func NewVMTServer() *VMTServer {
 	s := VMTServer{
-		Port:    KubeturboPort,
-		Address: "127.0.0.1",
+		Port:       KubeturboPort,
+		Address:    "127.0.0.1",
+		VMPriority: defaultVMPriority,
+		VMIsBase:   defaultVMIsBase,
 	}
 	return &s
 }
@@ -86,20 +104,20 @@ func NewVMTServer() *VMTServer {
 func (s *VMTServer) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.Port, "port", s.Port, "The port that kubeturbo's http service runs on")
 	fs.StringVar(&s.Address, "ip", s.Address, "the ip address that kubeturbo's http service runs on")
-	fs.IntVar(&s.CAdvisorPort, "cadvisor-port", K8sCadvisorPort, "The port of the cadvisor service runs on")
 	fs.StringVar(&s.Master, "master", s.Master, "The address of the Kubernetes API server (overrides any value in kubeconfig)")
 	fs.StringVar(&s.K8sTAPSpec, "turboconfig", s.K8sTAPSpec, "Path to the config file.")
 	fs.StringVar(&s.TestingFlagPath, "testingflag", s.TestingFlagPath, "Path to the testing flag.")
 	fs.StringVar(&s.KubeConfig, "kubeconfig", s.KubeConfig, "Path to kubeconfig file with authorization and master location information.")
 	fs.BoolVar(&s.EnableProfiling, "profiling", false, "Enable profiling via web interface host:port/debug/pprof/.")
-	fs.BoolVar(&s.UseVMWare, "usevmware", false, "If the underlying infrastructure is VMWare.")
-	fs.IntVar(&s.KubeletPort, "kubelet-port", kubelet.DefaultKubeletPort, "The port of the kubelet runs on")
-	fs.BoolVar(&s.EnableKubeletHttps, "kubelet-https", kubelet.DefaultKubeletHttps, "Indicate if Kubelet is running on https server")
-	fs.StringVar(&s.K8sVersion, "k8sVersion", executor.HigherK8sVersion, "the kubernetes server version; for openshift, it is the underlying Kubernetes' version.")
-	fs.StringVar(&s.NoneSchedulerName, "noneSchedulerName", executor.DefaultNoneExistSchedulerName, "a none-exist scheduler name, to prevent controller to create Running pods during move Action.")
-	fs.BoolVar(&s.enableNonDisruptiveSupport, "enable-non-disruptive-support", false, "Indicate if nondisruptive action support is enabled")
-
-	//leaderelection.BindFlags(&s.LeaderElection, fs)
+	fs.BoolVar(&s.UseUUID, "stitch-uuid", true, "Use VirtualMachine's UUID to do stitching, otherwise IP is used.")
+	fs.IntVar(&s.KubeletPort, "kubelet-port", DefaultKubeletPort, "The port of the kubelet runs on")
+	fs.BoolVar(&s.EnableKubeletHttps, "kubelet-https", DefaultKubeletHttps, "Indicate if Kubelet is running on https server")
+	fs.StringVar(&k8sVersion, "k8sVersion", k8sVersion, "[deprecated] the kubernetes server version; for openshift, it is the underlying Kubernetes' version.")
+	fs.StringVar(&noneSchedulerName, "noneSchedulerName", noneSchedulerName, "[deprecated] a none-exist scheduler name, to prevent controller to create Running pods during move Action.")
+	fs.IntVar(&s.DiscoveryIntervalSec, "discovery-interval-sec", defaultDiscoveryIntervalSec, "The discovery interval in seconds")
+	fs.IntVar(&s.ValidationWorkers, "validation-workers", defaultValidationWorkers, "The validation workers")
+	fs.IntVar(&s.ValidationTimeout, "validation-timeout-sec", defaultValidationTimeout, "The validation timeout in seconds")
+	fs.StringSliceVar(&s.sccSupport, "scc-support", defaultSccSupport, "The SCC list allowed for executing pod actions, e.g., --scc-support=restricted,anyuid or --scc-support=* to allow all")
 }
 
 // create an eventRecorder to send events to Kubernetes APIserver
@@ -137,10 +155,11 @@ func (s *VMTServer) createKubeClientOrDie(kubeConfig *restclient.Config) *kubern
 	return kubeClient
 }
 
-func (s *VMTServer) createKubeletClientOrDie(kubeConfig *restclient.Config) *kubelet.KubeletClient {
-	kubeletClient, err := kubelet.NewKubeletConfig(kubeConfig).
+func (s *VMTServer) createKubeletClientOrDie(kubeConfig *restclient.Config, allowTLSInsecure bool) *kubeclient.KubeletClient {
+	kubeletClient, err := kubeclient.NewKubeletConfig(kubeConfig).
 		WithPort(s.KubeletPort).
 		EnableHttps(s.EnableKubeletHttps).
+		AllowTLSInsecure(allowTLSInsecure).
 		//Timeout(to).
 		Create()
 	if err != nil {
@@ -149,45 +168,6 @@ func (s *VMTServer) createKubeletClientOrDie(kubeConfig *restclient.Config) *kub
 	}
 
 	return kubeletClient
-}
-
-func (s *VMTServer) createProbeConfigOrDie(kubeConfig *restclient.Config, kubeletClient *kubelet.KubeletClient) *configs.ProbeConfig {
-	// The default property type for stitching is IP.
-	pType := stitching.IP
-	if s.UseVMWare {
-		// If the underlying hypervisor is vCenter, use UUID.
-		// Refer to Bug: https://vmturbo.atlassian.net/browse/OM-18139
-		pType = stitching.UUID
-	}
-
-	// Create Kubelet monitoring
-	kubeletMonitoringConfig := kubelet.NewKubeletMonitorConfig(kubeletClient)
-
-	// Create cluster monitoring
-	masterMonitoringConfig, err := master.NewClusterMonitorConfig(kubeConfig)
-	if err != nil {
-		glog.Errorf("Failed to build monitor-config for master topology mointor: %v", err)
-		os.Exit(1)
-	}
-
-	// TODO for now kubelet is the only monitoring source. As we have more sources, we should choose what to be added into the slice here.
-	monitoringConfigs := []monitoring.MonitorWorkerConfig{
-		kubeletMonitoringConfig,
-		masterMonitoringConfig,
-	}
-
-	// Create K8sConntrack monitoring
-	// TODO, disable https by default. Change this when k8sconntrack supports https.
-	k8sConntrackMonitoringConfig := k8sconntrack.NewK8sConntrackMonitorConfig()
-	monitoringConfigs = append(monitoringConfigs, k8sConntrackMonitoringConfig)
-
-	probeConfig := &configs.ProbeConfig{
-		CadvisorPort:          s.CAdvisorPort,
-		StitchingPropertyType: pType,
-		MonitoringConfigs:     monitoringConfigs,
-	}
-
-	return probeConfig
 }
 
 func (s *VMTServer) checkFlag() error {
@@ -220,51 +200,63 @@ func (s *VMTServer) checkFlag() error {
 }
 
 // Run runs the specified VMTServer.  This should never exit.
-func (s *VMTServer) Run(_ []string) error {
+func (s *VMTServer) Run() {
 	if err := s.checkFlag(); err != nil {
 		glog.Errorf("check flag failed:%v. abort.", err.Error())
 		os.Exit(1)
 	}
 
+	kubeConfig := s.createKubeConfigOrDie()
+	glog.V(3).Infof("kubeConfig: %+v", kubeConfig)
+
+	kubeClient := s.createKubeClientOrDie(kubeConfig)
+
+	isOpenshift := checkServerVersion(kubeClient.DiscoveryClient.RESTClient())
+	glog.V(2).Info("Openshift cluster? ", isOpenshift)
+
+	// Allow insecure connection only if it's not an Openshift cluster
+	// For Kubernetes distro, the secure connection to Kubelet will fail due to
+	// the certificate issue of 'doesn't contain any IP SANs'.
+	// See https://github.com/kubernetes/kubernetes/issues/59372
+	kubeletClient := s.createKubeletClientOrDie(kubeConfig, !isOpenshift)
+
 	glog.V(3).Infof("spec path is: %v", s.K8sTAPSpec)
-	k8sTAPSpec, err := kubeturbo.ParseK8sTAPServiceSpec(s.K8sTAPSpec)
+	k8sTAPSpec, err := kubeturbo.ParseK8sTAPServiceSpec(s.K8sTAPSpec, kubeConfig.Host)
 	if err != nil {
 		glog.Errorf("Failed to generate correct TAP config: %v", err.Error())
 		os.Exit(1)
 	}
 
-	kubeConfig := s.createKubeConfigOrDie()
-	kubeClient := s.createKubeClientOrDie(kubeConfig)
-	kubeletClient := s.createKubeletClientOrDie(kubeConfig)
-	probeConfig := s.createProbeConfigOrDie(kubeConfig, kubeletClient)
-	broker := turbostore.NewPodBroker()
-
+	// Configuration for creating the Kubeturbo TAP service
 	vmtConfig := kubeturbo.NewVMTConfig2()
 	vmtConfig.WithTapSpec(k8sTAPSpec).
 		WithKubeClient(kubeClient).
 		WithKubeletClient(kubeletClient).
-		WithProbeConfig(probeConfig).
-		WithBroker(broker).
-		WithK8sVersion(s.K8sVersion).
-		WithNoneScheduler(s.NoneSchedulerName).
-		WithRecorder(createRecorder(kubeClient)).
-		WithEnableNonDisruptiveFlag(s.enableNonDisruptiveSupport)
+		WithVMPriority(s.VMPriority).
+		WithVMIsBase(s.VMIsBase).
+		UsingUUIDStitch(s.UseUUID).
+		WithDiscoveryInterval(s.DiscoveryIntervalSec).
+		WithValidationTimeout(s.ValidationTimeout).
+		WithValidationWorkers(s.ValidationWorkers).
+		WithSccSupport(s.sccSupport)
 	glog.V(3).Infof("Finished creating turbo configuration: %+v", vmtConfig)
 
-	vmtService := kubeturbo.NewKubeturboService(vmtConfig)
-	run := func(_ <-chan struct{}) {
-		vmtService.Run()
-		select {}
+	// The KubeTurbo TAP service
+	k8sTAPService, err := kubeturbo.NewKubernetesTAPService(vmtConfig)
+	if err != nil {
+		glog.Fatalf("Unexpected error while creating Kuberntes TAP service: %s", err)
 	}
 
+	// The client for healthz, debug, and prometheus
 	go s.startHttp()
-
-	//if !s.LeaderElection.LeaderElect {
 	glog.V(2).Infof("No leader election")
-	run(nil)
 
-	glog.Fatal("this statement is unreachable")
-	panic("unreachable")
+	glog.V(1).Infof("********** Start runnning Kubeturbo Service **********")
+	// Disconnect from Turbo server when Kubeturbo is shutdown
+	handleExit(func() { k8sTAPService.DisconnectFromTurbo() })
+	k8sTAPService.ConnectToTurbo()
+
+	glog.V(1).Info("Kubeturbo service is stopped.")
 }
 
 func (s *VMTServer) startHttp() {
@@ -289,4 +281,45 @@ func (s *VMTServer) startHttp() {
 		Handler: mux,
 	}
 	glog.Fatal(server.ListenAndServe())
+}
+
+// handleExit disconnects the tap service from Turbo service when Kubeturbo is shotdown
+func handleExit(disconnectFunc disconnectFromTurboFunc) { //k8sTAPService *kubeturbo.K8sTAPService) {
+	glog.V(4).Infof("*** Handling Kubeturbo Termination ***")
+	sigChan := make(chan os.Signal)
+	signal.Notify(sigChan,
+		os.Interrupt,
+		syscall.SIGTERM,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGHUP)
+
+	go func() {
+		select {
+		case sig := <-sigChan:
+			// Close the mediation container including the endpoints. It avoids the
+			// invalid endpoints remaining in the server side. See OM-28801.
+			glog.V(2).Infof("Signal %s received. Disconnecting from Turbo server...\n", sig)
+			disconnectFunc()
+		}
+	}()
+}
+
+// checkServerVersion checks and logs the server version and return if it is Openshift distro
+func checkServerVersion(restClient restclient.Interface) bool {
+	// Check Kubernetes version
+	bytes, err := restClient.Get().AbsPath("/version").DoRaw()
+	if err != nil {
+		glog.Errorf("Unable to get Kubernetes version info: %v", err)
+		return false
+	}
+	glog.V(2).Info("Kubernetes version: ", string(bytes))
+
+	// Check Openshift version, if exists
+	if bytes, err = restClient.Get().AbsPath("/version/openshift").DoRaw(); err == nil {
+		glog.V(2).Info("Openshift version: ", string(bytes))
+		return true
+	}
+
+	return false
 }

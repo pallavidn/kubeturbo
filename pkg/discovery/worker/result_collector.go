@@ -27,9 +27,11 @@ func (rc *ResultCollector) ResultPool() chan *task.TaskResult {
 	return rc.resultPool
 }
 
-func (rc *ResultCollector) Collect(count int) ([]*proto.EntityDTO, []*repository.QuotaMetrics) {
+func (rc *ResultCollector) Collect(count int) ([]*proto.EntityDTO, []*repository.QuotaMetrics, []*repository.EntityGroup) {
+	//map[string]*repository.PolicyGroup) {
 	discoveryResult := []*proto.EntityDTO{}
 	quotaMetricsList := []*repository.QuotaMetrics{}
+	entityGroupList := []*repository.EntityGroup{}
 	discoveryErrorString := []string{}
 
 	glog.V(2).Infof("Waiting for results from %d workers.", count)
@@ -43,11 +45,16 @@ func (rc *ResultCollector) Collect(count int) ([]*proto.EntityDTO, []*repository
 			case <-stopChan:
 				return
 			case result := <-rc.resultPool:
+				glog.V(2).Infof("Processing results from worker %s", result.WorkerId())
 				if err := result.Err(); err != nil {
 					discoveryErrorString = append(discoveryErrorString, err.Error())
 				} else {
+					// Entity DTOs for pods, nodes, containers from different workers
 					discoveryResult = append(discoveryResult, result.Content()...)
+					// Quota metrics from different workers
 					quotaMetricsList = append(quotaMetricsList, result.QuotaMetrics()...)
+					// Group data from different workers
+					entityGroupList = append(entityGroupList, result.EntityGroups()...)
 				}
 				wg.Done()
 			}
@@ -62,5 +69,5 @@ func (rc *ResultCollector) Collect(count int) ([]*proto.EntityDTO, []*repository
 		glog.Errorf("One or more discovery worker failed: %s", strings.Join(discoveryErrorString, "\t\t"))
 	}
 
-	return discoveryResult, quotaMetricsList
+	return discoveryResult, quotaMetricsList, entityGroupList
 }

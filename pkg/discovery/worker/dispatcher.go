@@ -5,7 +5,7 @@ import (
 	"github.com/turbonomic/kubeturbo/pkg/cluster"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/task"
-	api "k8s.io/client-go/pkg/api/v1"
+	api "k8s.io/api/core/v1"
 	"math"
 
 	"github.com/golang/glog"
@@ -81,7 +81,7 @@ func (d *Dispatcher) Dispatch(nodes []*api.Node, cluster *repository.ClusterSumm
 	for assignedNodesCount+perTaskNodeLength <= len(nodes) {
 		currNodes := nodes[assignedNodesCount : assignedNodesCount+perTaskNodeLength]
 
-		currPods := d.config.clusterInfoScraper.GetRunningPodsOnNodes(currNodes)
+		currPods := d.config.clusterInfoScraper.GetRunningAndReadyPodsOnNodes(currNodes)
 
 		currTask := task.NewTask().WithNodes(currNodes).WithPods(currPods).WithCluster(cluster)
 		d.assignTask(currTask)
@@ -92,8 +92,8 @@ func (d *Dispatcher) Dispatch(nodes []*api.Node, cluster *repository.ClusterSumm
 	}
 	if assignedNodesCount < len(nodes) {
 		currNodes := nodes[assignedNodesCount:]
-		currPods := d.config.clusterInfoScraper.GetRunningPodsOnNodes(currNodes)
-		currTask := task.NewTask().WithNodes(currNodes).WithPods(currPods)
+		currPods := d.config.clusterInfoScraper.GetRunningAndReadyPodsOnNodes(currNodes)
+		currTask := task.NewTask().WithNodes(currNodes).WithPods(currPods).WithCluster(cluster)
 		d.assignTask(currTask)
 
 		assignedWorkerCount++

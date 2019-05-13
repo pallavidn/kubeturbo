@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
-	api "k8s.io/client-go/pkg/api/v1"
+	api "k8s.io/api/core/v1"
 
 	sdkbuilder "github.com/turbonomic/turbo-go-sdk/pkg/builder"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	accessCommodityDefaultCapacity = 1E10
+	accessCommodityDefaultCapacity = 1e10
 )
 
 type AffinityCommodityManager struct {

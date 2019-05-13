@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/detectors"
 	"io/ioutil"
 
-	client "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
 
 	"github.com/turbonomic/kubeturbo/pkg/action"
 	"github.com/turbonomic/kubeturbo/pkg/discovery"
@@ -17,32 +18,43 @@ import (
 	"github.com/turbonomic/turbo-go-sdk/pkg/service"
 
 	"github.com/golang/glog"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/kubelet"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/master"
 )
 
 type K8sTAPServiceSpec struct {
 	*service.TurboCommunicationConfig `json:"communicationConfig,omitempty"`
 	*configs.K8sTargetConfig          `json:"targetConfig,omitempty"`
+	*detectors.MasterNodeDetectors    `json:"masterNodeDetectors,omitempty"`
+	*detectors.DaemonPodDetectors     `json:"daemonPodDetectors,omitempty"`
 }
 
-func ParseK8sTAPServiceSpec(configFile string) (*K8sTAPServiceSpec, error) {
+func ParseK8sTAPServiceSpec(configFile, defaultTargetName string) (*K8sTAPServiceSpec, error) {
 	// load the config
 	tapSpec, err := readK8sTAPServiceSpec(configFile)
 	if err != nil {
 		return nil, err
 	}
-	glog.V(3).Infof("K8sTapSericeSpec is: %+v", tapSpec)
+	glog.V(3).Infof("K8sTapServiceSpec is: %+v", tapSpec)
 
 	if tapSpec.TurboCommunicationConfig == nil {
-		return nil, errors.New("Communication config is missing")
+		return nil, errors.New("communication config is missing")
 	}
 	if err := tapSpec.ValidateTurboCommunicationConfig(); err != nil {
 		return nil, err
 	}
 
 	if tapSpec.K8sTargetConfig == nil {
-		return nil, errors.New("Target config is missing")
+		if defaultTargetName == "" {
+			return nil, errors.New("target name is empty")
+		}
+		tapSpec.K8sTargetConfig = &configs.K8sTargetConfig{TargetIdentifier: defaultTargetName}
 	}
 	if err := tapSpec.ValidateK8sTargetConfig(); err != nil {
+		return nil, err
+	}
+	if err := detectors.ValidateAndParseDetectors(tapSpec.MasterNodeDetectors, tapSpec.DaemonPodDetectors); err != nil {
 		return nil, err
 	}
 	return tapSpec, nil
@@ -51,57 +63,84 @@ func ParseK8sTAPServiceSpec(configFile string) (*K8sTAPServiceSpec, error) {
 func readK8sTAPServiceSpec(path string) (*K8sTAPServiceSpec, error) {
 	file, e := ioutil.ReadFile(path)
 	if e != nil {
-		return nil, fmt.Errorf("File error: %v\n" + e.Error())
+		return nil, fmt.Errorf("file error: %v" + e.Error())
 	}
 	var spec K8sTAPServiceSpec
 	err := json.Unmarshal(file, &spec)
 	if err != nil {
-		return nil, fmt.Errorf("Unmarshall error :%v", err.Error())
+		return nil, fmt.Errorf("unmarshall error :%v", err.Error())
 	}
 	return &spec, nil
 }
 
-type K8sTAPServiceConfig struct {
-	spec                     *K8sTAPServiceSpec
-	probeConfig              *configs.ProbeConfig
-	registrationClientConfig *registration.RegistrationConfig
-	discoveryClientConfig    *discovery.DiscoveryClientConfig
+func createTargetConfig(kubeConfig *restclient.Config) *configs.K8sTargetConfig {
+	return &configs.K8sTargetConfig{TargetIdentifier: kubeConfig.Host}
 }
 
-func NewK8sTAPServiceConfig(kubeClient *client.Clientset, probeConfig *configs.ProbeConfig,
-	spec *K8sTAPServiceSpec) *K8sTAPServiceConfig {
-	registrationClientConfig := registration.NewRegistrationClientConfig(probeConfig.StitchingPropertyType)
-	discoveryClientConfig := discovery.NewDiscoveryConfig(kubeClient, probeConfig, spec.K8sTargetConfig)
-	return &K8sTAPServiceConfig{
-		spec: spec,
-		registrationClientConfig: registrationClientConfig,
-		discoveryClientConfig:    discoveryClientConfig,
+func createProbeConfigOrDie(c *Config) *configs.ProbeConfig {
+	// Create Kubelet monitoring
+	kubeletMonitoringConfig := kubelet.NewKubeletMonitorConfig(c.KubeletClient)
+
+	// Create cluster monitoring
+	masterMonitoringConfig := master.NewClusterMonitorConfig(c.Client)
+
+	// TODO for now kubelet is the only monitoring source. As we have more sources, we should choose what to be added into the slice here.
+	monitoringConfigs := []monitoring.MonitorWorkerConfig{
+		kubeletMonitoringConfig,
+		masterMonitoringConfig,
 	}
+
+	probeConfig := &configs.ProbeConfig{
+		StitchingPropertyType: c.StitchingPropType,
+		MonitoringConfigs:     monitoringConfigs,
+		ClusterClient:         c.Client,
+		NodeClient:            c.KubeletClient,
+	}
+
+	return probeConfig
 }
 
 type K8sTAPService struct {
 	*service.TAPService
 }
 
-func NewKubernetesTAPService(config *K8sTAPServiceConfig, actionHandler *action.ActionHandler) (*K8sTAPService, error) {
-	if config == nil || config.spec == nil {
-		return nil, errors.New("Invalid K8sTAPServiceConfig")
+func NewKubernetesTAPService(config *Config) (*K8sTAPService, error) {
+	if config == nil || config.tapSpec == nil {
+		return nil, errors.New("invalid K8sTAPServiceConfig")
 	}
-	// Kubernetes Probe Registration Client
-	registrationClient := registration.NewK8sRegistrationClient(config.registrationClientConfig)
-	// Kubernetes Probe Discovery Client
-	discoveryClient := discovery.NewK8sDiscoveryClient(config.discoveryClientConfig)
 
+	// Create the configurations for the registration, discovery and action clients
+	registrationClientConfig := registration.NewRegistrationClientConfig(config.StitchingPropType, config.VMPriority, config.VMIsBase)
+
+	probeConfig := createProbeConfigOrDie(config)
+	discoveryClientConfig := discovery.NewDiscoveryConfig(probeConfig, config.tapSpec.K8sTargetConfig, config.ValidationWorkers, config.ValidationTimeoutSec)
+
+	actionHandlerConfig := action.NewActionHandlerConfig(config.Client, config.KubeletClient, config.SccSupport)
+
+	// Kubernetes Probe Registration Client
+	registrationClient := registration.NewK8sRegistrationClient(registrationClientConfig)
+
+	// Kubernetes Probe Discovery Client
+	discoveryClient := discovery.NewK8sDiscoveryClient(discoveryClientConfig)
+
+	// Kubernetes Probe Action Execution Client
+	actionHandler := action.NewActionHandler(actionHandlerConfig)
+
+	// The KubeTurbo TAP Service that will register the kubernetes target with the
+	// Turbonomic server and await for validation, discovery, action execution requests
 	tapService, err :=
 		service.NewTAPServiceBuilder().
-			WithTurboCommunicator(config.spec.TurboCommunicationConfig).
-			WithTurboProbe(probe.NewProbeBuilder(config.spec.TargetType, config.spec.ProbeCategory).
+			WithTurboCommunicator(config.tapSpec.TurboCommunicationConfig).
+			WithTurboProbe(probe.NewProbeBuilder(config.tapSpec.TargetType, config.tapSpec.ProbeCategory).
+				WithDiscoveryOptions(probe.FullRediscoveryIntervalSecondsOption(int32(config.DiscoveryIntervalSec))).
 				RegisteredBy(registrationClient).
-				DiscoversTarget(config.spec.TargetIdentifier, discoveryClient).
+				WithActionPolicies(registrationClient).
+				WithEntityMetadata(registrationClient).
+				DiscoversTarget(config.tapSpec.TargetIdentifier, discoveryClient).
 				ExecutesActionsBy(actionHandler)).
 			Create()
 	if err != nil {
-		return nil, fmt.Errorf("Error when creating KubernetesTAPService: %s", err)
+		return nil, err
 	}
 
 	return &K8sTAPService{tapService}, nil

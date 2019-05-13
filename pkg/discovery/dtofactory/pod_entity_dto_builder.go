@@ -3,7 +3,7 @@ package dtofactory
 import (
 	"fmt"
 
-	api "k8s.io/client-go/pkg/api/v1"
+	api "k8s.io/api/core/v1"
 
 	"github.com/turbonomic/kubeturbo/pkg/discovery/dtofactory/property"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	applicationCommodityDefaultCapacity = 1E10
+	applicationCommodityDefaultCapacity = 1e10
 )
 
 var (
@@ -29,14 +29,16 @@ var (
 	podResourceCommodityBoughtFromNode = []metrics.ResourceType{
 		metrics.CPU,
 		metrics.Memory,
-		// TODO, add back provisioned commodity later.
-		//metrics.CPUProvisioned,
-		//metrics.MemoryProvisioned,
+		metrics.CPURequest,
+		metrics.MemoryRequest,
+		// TODO, add back provisioned commodity later
 	}
 
 	podResourceCommodityBoughtFromQuota = []metrics.ResourceType{
-		metrics.CPULimit,
-		metrics.MemoryLimit,
+		metrics.CPUQuota,
+		metrics.MemoryQuota,
+		metrics.CPURequestQuota,
+		metrics.MemoryRequestQuota,
 	}
 )
 
@@ -68,9 +70,9 @@ func (builder *podEntityDTOBuilder) BuildEntityDTOs(pods []*api.Pod) ([]*proto.E
 		// display name.
 		displayName := util.GetPodClusterID(pod)
 		entityDTOBuilder.DisplayName(displayName)
-		cpuFrequency, err := builder.getNodeCPUFrequency(pod)
+		cpuFrequency, err := builder.getNodeCPUFrequency(util.NodeKeyFromPodFunc(pod))
 		if err != nil {
-			glog.Errorf("failed to build pod[%s] EntityDTO: %v", displayName, err)
+			glog.Errorf("Failed to build EntityDTO for pod %s: %v", displayName, err)
 			continue
 		}
 		// commodities sold.
@@ -99,12 +101,11 @@ func (builder *podEntityDTOBuilder) BuildEntityDTOs(pods []*api.Pod) ([]*proto.E
 
 		quotaUID, exists := builder.quotaNameUIDMap[pod.Namespace]
 		if exists {
-			commoditiesBoughtQuota, err := builder.getPodCommoditiesBoughtFromQuota(pod, cpuFrequency)
+			commoditiesBoughtQuota, err := builder.getPodCommoditiesBoughtFromQuota(quotaUID, pod, cpuFrequency)
 			if err != nil {
 				glog.Errorf("Error when create commoditiesBought for pod %s: %s", displayName, err)
 				continue
 			}
-
 			provider := sdkbuilder.CreateProvider(proto.EntityDTO_VIRTUAL_DATACENTER, quotaUID)
 			entityDTOBuilder = entityDTOBuilder.Provider(provider)
 			entityDTOBuilder.BuysCommodities(commoditiesBoughtQuota)
@@ -120,9 +121,19 @@ func (builder *podEntityDTOBuilder) BuildEntityDTOs(pods []*api.Pod) ([]*proto.E
 		}
 		entityDTOBuilder = entityDTOBuilder.WithProperties(properties)
 
-		if !util.Monitored(pod) {
-			entityDTOBuilder.Monitored(false)
+		controllable := util.Controllable(pod)
+		if !controllable {
+			glog.V(3).Infof("Pod %v is not controllable.", displayName)
 		}
+		daemon := util.Daemon(pod)
+		entityDTOBuilder.ConsumerPolicy(&proto.EntityDTO_ConsumerPolicy{
+			Controllable: &controllable,
+			Daemon:       &daemon,
+		})
+
+		entityDTOBuilder = entityDTOBuilder.ContainerPodData(builder.createContainerPodData(pod))
+
+		entityDTOBuilder.WithPowerState(proto.EntityDTO_POWERED_ON)
 
 		// build entityDTO.
 		entityDto, err := entityDTOBuilder.Create()
@@ -138,36 +149,26 @@ func (builder *podEntityDTOBuilder) BuildEntityDTOs(pods []*api.Pod) ([]*proto.E
 	return result, nil
 }
 
-// get cpu frequency
-func (builder *podEntityDTOBuilder) getNodeCPUFrequency(pod *api.Pod) (float64, error) {
-	key := util.NodeKeyFromPodFunc(pod)
-	cpuFrequencyUID := metrics.GenerateEntityStateMetricUID(metrics.NodeType, key, metrics.CpuFrequency)
-	cpuFrequencyMetric, err := builder.metricsSink.GetMetric(cpuFrequencyUID)
-	if err != nil {
-		err := fmt.Errorf("Failed to get cpu frequency from sink for node %s: %v", key, err)
-		glog.Error(err)
-		return 0.0, err
-	}
-
-	cpuFrequency := cpuFrequencyMetric.GetValue().(float64)
-	return cpuFrequency, nil
-}
-
 // Build the CommodityDTOs sold  by the pod for vCPU, vMem and VMPMAcces.
 // VMPMAccess is used to bind container to the hosting pod so the container is not moved out of the pod
 func (builder *podEntityDTOBuilder) getPodCommoditiesSold(pod *api.Pod, cpuFrequency float64) ([]*proto.CommodityDTO, error) {
 	var commoditiesSold []*proto.CommodityDTO
-	key := util.PodKeyFunc(pod)
 
 	// cpu and cpu provisioned needs to be converted from number of cores to frequency.
-	converter := NewConverter().Set(func(input float64) float64 { return input * cpuFrequency }, metrics.CPU, metrics.CPUProvisioned)
+	converter := NewConverter().Set(func(input float64) float64 { return input * cpuFrequency }, metrics.CPU)
 
 	attributeSetter := NewCommodityAttrSetter()
 	attributeSetter.Add(func(commBuilder *sdkbuilder.CommodityDTOBuilder) { commBuilder.Resizable(false) }, metrics.CPU, metrics.Memory)
 
 	// Resource Commodities
-	resourceCommoditiesSold, err := builder.getResourceCommoditiesSold(metrics.PodType, key, podResourceCommoditySold, converter, attributeSetter)
+	podMId := util.PodMetricIdAPI(pod)
+	resourceCommoditiesSold, err := builder.getResourceCommoditiesSold(metrics.PodType, podMId, podResourceCommoditySold, converter, attributeSetter)
 	if err != nil {
+		return nil, err
+	}
+	if len(resourceCommoditiesSold) != len(podResourceCommoditySold) {
+		err = fmt.Errorf("mismatch num of bought commidities from node (%d Vs. %d) for pod %s", len(resourceCommoditiesSold), len(podResourceCommoditySold), pod.Name)
+		glog.Error(err)
 		return nil, err
 	}
 	commoditiesSold = append(commoditiesSold, resourceCommoditiesSold...)
@@ -186,21 +187,22 @@ func (builder *podEntityDTOBuilder) getPodCommoditiesSold(pod *api.Pod, cpuFrequ
 }
 
 // Build the CommodityDTOs bought by the pod from the node provider.
-// Commodities bought are vCPU, vMem, cpuProvisioned, memProvisioned, access, cluster
+// Commodities bought are vCPU, vMem vmpm access, cluster
 func (builder *podEntityDTOBuilder) getPodCommoditiesBought(pod *api.Pod, cpuFrequency float64) ([]*proto.CommodityDTO, error) {
 	var commoditiesBought []*proto.CommodityDTO
-	key := util.PodKeyFunc(pod)
 
 	// cpu and cpu provisioned needs to be converted from number of cores to frequency.
-	converter := NewConverter().Set(func(input float64) float64 { return input * cpuFrequency }, metrics.CPU, metrics.CPUProvisioned)
-
-	//// attr TODO: pod is movable, but not resizable.
-	//attributeSetter := NewCommodityAttrSetter()
-	//attributeSetter.Add(func(commBuilder *sdkbuilder.CommodityDTOBuilder) { commBuilder.Resizable(true) }, metrics.CPU, metrics.Memory)
+	converter := NewConverter().Set(func(input float64) float64 { return input * cpuFrequency }, metrics.CPU, metrics.CPURequest)
 
 	// Resource Commodities.
-	resourceCommoditiesBought, err := builder.getResourceCommoditiesBought(metrics.PodType, key, podResourceCommodityBoughtFromNode, converter, nil)
+	podMId := util.PodMetricIdAPI(pod)
+	resourceCommoditiesBought, err := builder.getResourceCommoditiesBought(metrics.PodType, podMId, podResourceCommodityBoughtFromNode, converter, nil)
 	if err != nil {
+		return nil, err
+	}
+	if len(resourceCommoditiesBought) != len(podResourceCommodityBoughtFromNode) {
+		err = fmt.Errorf("mismatch num of bought commidities from node (%d Vs. %d) for pod %s", len(resourceCommoditiesBought), len(podResourceCommodityBoughtFromNode), pod.Name)
+		glog.Error(err)
 		return nil, err
 	}
 	commoditiesBought = append(commoditiesBought, resourceCommoditiesBought...)
@@ -218,7 +220,7 @@ func (builder *podEntityDTOBuilder) getPodCommoditiesBought(pod *api.Pod, cpuFre
 	}
 
 	// Access commodity: schedulable
-	if util.Monitored(pod) {
+	if util.Controllable(pod) {
 		schedAccessComm, err := sdkbuilder.NewCommodityDTOBuilder(proto.CommodityDTO_VMPM_ACCESS).
 			Key(schedAccessCommodityKey).
 			Create()
@@ -251,21 +253,26 @@ func (builder *podEntityDTOBuilder) getPodCommoditiesBought(pod *api.Pod, cpuFre
 }
 
 // Build the CommodityDTOs bought by the pod from the quota provider.
-func (builder *podEntityDTOBuilder) getPodCommoditiesBoughtFromQuota(pod *api.Pod, cpuFrequency float64) ([]*proto.CommodityDTO, error) {
+func (builder *podEntityDTOBuilder) getPodCommoditiesBoughtFromQuota(quotaUID string, pod *api.Pod, cpuFrequency float64) ([]*proto.CommodityDTO, error) {
 	var commoditiesBought []*proto.CommodityDTO
 	key := util.PodKeyFunc(pod)
 
-	// cpu and cpu provisioned needs to be converted from number of cores to frequency.
+	// cpu allocation needs to be converted from number of cores to frequency.
 	converter := NewConverter().Set(func(input float64) float64 {
 		return input * cpuFrequency
-	}, metrics.CPU, metrics.CPULimit)
+	}, metrics.CPUQuota, metrics.CPURequestQuota)
 
 	// Resource Commodities.
-	resourceCommoditiesBought, err := builder.getResourceCommoditiesBought(metrics.PodType, key, podResourceCommodityBoughtFromQuota, converter, nil)
-	if err != nil {
-		return nil, err
+	for _, resourceType := range podResourceCommodityBoughtFromQuota {
+		commBought, err := builder.getResourceCommodityBoughtWithKey(metrics.PodType, key,
+			resourceType, quotaUID, converter, nil)
+		if err != nil {
+			glog.Errorf("Failed to build %s bought by pod %s from quota %s: %v",
+				resourceType, key, quotaUID, err)
+			return nil, err
+		}
+		commoditiesBought = append(commoditiesBought, commBought)
 	}
-	commoditiesBought = append(commoditiesBought, resourceCommoditiesBought...)
 	return commoditiesBought, nil
 }
 
@@ -279,13 +286,36 @@ func (builder *podEntityDTOBuilder) getPodProperties(pod *api.Pod) ([]*proto.Ent
 	podClusterID := util.GetPodClusterID(pod)
 	nodeName := pod.Spec.NodeName
 	if nodeName == "" {
-		return nil, fmt.Errorf("Cannot find the hosting node ID for pod %s", podClusterID)
+		return nil, fmt.Errorf("cannot find the hosting node ID for pod %s", podClusterID)
 	}
-	stitchingProperty, err := builder.stitchingManager.BuildStitchingProperty(nodeName, stitching.Stitch)
+
+	stitchingProperty, err := builder.stitchingManager.BuildDTOProperty(nodeName, false)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to build EntityDTO for Pod %s: %s", podClusterID, err)
+		return nil, fmt.Errorf("failed to build EntityDTO for Pod %s: %s", podClusterID, err)
 	}
 	properties = append(properties, stitchingProperty)
 
 	return properties, nil
+}
+
+func (builder *podEntityDTOBuilder) createContainerPodData(pod *api.Pod) *proto.EntityDTO_ContainerPodData {
+	// Add IP address in ContainerPodData. Some pods (system pods and daemonset pods) may use the host IP as the pod IP,
+	// in which case the IP address will not be unique (in the k8s cluster) and hence not populated in ContainerPodData.
+	fullName := pod.Name
+	ns := pod.Namespace
+	port := "not-set"
+	if pod.Status.PodIP != "" && pod.Status.PodIP != pod.Status.HostIP {
+		return &proto.EntityDTO_ContainerPodData{
+			// Note the port needs to be set if needed
+			IpAddress: &(pod.Status.PodIP),
+			Port:      &port,
+			FullName:  &fullName,
+			Namespace: &ns,
+		}
+	}
+
+	if pod.Status.PodIP == "" {
+		glog.Errorf("No IP found for pod %s", fullName)
+	}
+	return nil
 }

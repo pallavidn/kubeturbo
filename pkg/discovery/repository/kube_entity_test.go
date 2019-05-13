@@ -23,8 +23,8 @@ var TestSoldResources = []struct {
 }{
 	{metrics.CPU, 200},
 	{metrics.Memory, 2},
-	{metrics.MemoryLimit, 1},
-	{metrics.CPULimit, 100},
+	{metrics.MemoryQuota, 1},
+	{metrics.CPUQuota, 100},
 }
 
 var TestProvider = []struct {
@@ -34,7 +34,7 @@ var TestProvider = []struct {
 }{
 	{metrics.NodeType, "node1", map[metrics.ResourceType]float64{metrics.CPU: 500, metrics.Memory: 3}},
 	{metrics.NodeType, "node2", map[metrics.ResourceType]float64{metrics.CPU: 500, metrics.Memory: 3}},
-	{metrics.NodeType, "node3", map[metrics.ResourceType]float64{metrics.CPULimit: 500}},
+	{metrics.NodeType, "node3", map[metrics.ResourceType]float64{metrics.CPUQuota: 500}},
 }
 
 func TestKubeEntity(t *testing.T) {
@@ -69,6 +69,32 @@ func TestKubeEntityAddResource(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Equal(t, kubeResource.Capacity, testResource.capacity)
 		assert.Equal(t, kubeResource.Used, 0.0)
+	}
+}
+
+func TestKubeEntityChangeResourceCapacity(t *testing.T) {
+	namespace := "ns1"
+	cluster := "cluster1"
+	var testEntity = struct {
+		entityType metrics.DiscoveredEntityType
+		name       string
+		uid        string
+	}{metrics.PodType, "pod1", "pod1"}
+
+	kubeEntity := NewKubeEntity(testEntity.entityType, cluster, namespace,
+		testEntity.name, testEntity.uid)
+	for _, testResource := range TestSoldResources {
+		kubeEntity.AddResource(testResource.resourceType, testResource.capacity, 0.0)
+	}
+	for _, testResource := range TestSoldResources {
+		_, err := kubeEntity.GetResource(testResource.resourceType)
+		assert.Nil(t, err)
+		cpuCap, _ := kubeEntity.GetResourceCapacity(testResource.resourceType)
+		assert.Equal(t, testResource.capacity, cpuCap)
+
+		kubeEntity.SetResourceCapacity(testResource.resourceType, testResource.capacity*2)
+		cpuCap, _ = kubeEntity.GetResourceCapacity(testResource.resourceType)
+		assert.Equal(t, testResource.capacity*2, cpuCap)
 	}
 }
 

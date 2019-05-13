@@ -3,20 +3,18 @@ package cluster
 import (
 	"fmt"
 
+	api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
 	client "k8s.io/client-go/kubernetes"
-	api "k8s.io/client-go/pkg/api/v1"
-	restclient "k8s.io/client-go/rest"
 
 	"github.com/golang/glog"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
 )
 
 const (
-	k8sDefaultNamespace = "default"
-
+	k8sDefaultNamespace   = "default"
 	kubernetesServiceName = "kubernetes"
 )
 
@@ -24,6 +22,16 @@ var (
 	labelSelectEverything = labels.Everything().String()
 	fieldSelectEverything = fields.Everything().String()
 )
+
+type ClusterScraperInterface interface {
+	GetAllNodes() ([]*api.Node, error)
+	GetNamespaces() ([]*api.Namespace, error)
+	GetNamespaceQuotas() (map[string][]*api.ResourceQuota, error)
+	GetAllPods() ([]*api.Pod, error)
+	GetAllEndpoints() ([]*api.Endpoints, error)
+	GetAllServices() ([]*api.Service, error)
+	GetKubernetesServiceID() (svcID string, err error)
+}
 
 type ClusterScraper struct {
 	*client.Clientset
@@ -35,15 +43,48 @@ func NewClusterScraper(kclient *client.Clientset) *ClusterScraper {
 	}
 }
 
-func NewClusterInfoScraper(kubeConfig *restclient.Config) (*ClusterScraper, error) {
-	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
+func (s *ClusterScraper) GetNamespaces() ([]*api.Namespace, error) {
+	namespaceList, err := s.CoreV1().Namespaces().List(metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create kubeClient: %s", err)
+		return nil, err
+	}
+	namespaces := make([]*api.Namespace, len(namespaceList.Items))
+	for i := 0; i < len(namespaceList.Items); i++ {
+		namespaces[i] = &namespaceList.Items[i]
+	}
+	return namespaces, nil
+}
+
+func (s *ClusterScraper) getResourceQuotas() ([]*api.ResourceQuota, error) {
+	namespace := api.NamespaceAll
+	quotaList, err := s.CoreV1().ResourceQuotas(namespace).List(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	quotas := make([]*api.ResourceQuota, len(quotaList.Items))
+	for i := 0; i < len(quotaList.Items); i++ {
+		quotas[i] = &quotaList.Items[i]
+	}
+	return quotas, nil
+}
+
+// Return a map containing namespace and the list of quotas defined in the namespace.
+func (s *ClusterScraper) GetNamespaceQuotas() (map[string][]*api.ResourceQuota, error) {
+	quotaList, err := s.getResourceQuotas()
+	if err != nil {
+		return nil, err
 	}
 
-	return &ClusterScraper{
-		Clientset: kubeClient,
-	}, nil
+	quotaMap := make(map[string][]*api.ResourceQuota)
+	for _, item := range quotaList {
+		quotaList, exists := quotaMap[item.Namespace]
+		if !exists {
+			quotaList = []*api.ResourceQuota{}
+		}
+		quotaList = append(quotaList, item)
+		quotaMap[item.Namespace] = quotaList
+	}
+	return quotaMap, nil
 }
 
 func (s *ClusterScraper) GetNamespaces() ([]*api.Namespace, error) {
@@ -103,8 +144,9 @@ func (s *ClusterScraper) GetNodes(opts metav1.ListOptions) ([]*api.Node, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to list all nodes in the cluster: %s", err)
 	}
-	nodes := make([]*api.Node, len(nodeList.Items))
-	for i := 0; i < len(nodeList.Items); i++ {
+	n := len(nodeList.Items)
+	nodes := make([]*api.Node, n)
+	for i := 0; i < n; i++ {
 		nodes[i] = &nodeList.Items[i]
 	}
 	return nodes, nil
@@ -181,7 +223,7 @@ func (s *ClusterScraper) GetKubernetesServiceID() (svcID string, err error) {
 	return
 }
 
-func (s *ClusterScraper) GetRunningPodsOnNodes(nodeList []*api.Node) []*api.Pod {
+func (s *ClusterScraper) GetRunningAndReadyPodsOnNodes(nodeList []*api.Node) []*api.Pod {
 	pods := []*api.Pod{}
 	for _, node := range nodeList {
 		nodeRunningPodsList, err := s.findRunningPodsOnNode(node.Name)
@@ -191,7 +233,7 @@ func (s *ClusterScraper) GetRunningPodsOnNodes(nodeList []*api.Node) []*api.Pod 
 		}
 		pods = append(pods, nodeRunningPodsList...)
 	}
-	return pods
+	return util.GetReadyPods(pods)
 }
 
 // TODO, create a local pod, node cache to avoid too many API request.
@@ -201,7 +243,7 @@ func (s *ClusterScraper) findRunningPodsOnNode(nodeName string) ([]*api.Pod, err
 	if err != nil {
 		return nil, err
 	}
-	podList, err := s.Pods(api.NamespaceAll).List(metav1.ListOptions{FieldSelector: fieldSelector.String()})
+	podList, err := s.CoreV1().Pods(api.NamespaceAll).List(metav1.ListOptions{FieldSelector: fieldSelector.String()})
 	if err != nil {
 		return nil, err
 	}

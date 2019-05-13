@@ -4,7 +4,7 @@ import (
 	"errors"
 	"sync"
 
-	api "k8s.io/client-go/pkg/api/v1"
+	api "k8s.io/api/core/v1"
 	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
@@ -15,13 +15,14 @@ import (
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 
 	"github.com/golang/glog"
+	"github.com/turbonomic/kubeturbo/pkg/kubeclient"
 )
 
 // KubeletMonitor is a resource monitoring worker.
 type KubeletMonitor struct {
 	nodeList []*api.Node
 
-	kubeletClient *KubeletClient
+	kubeletClient *kubeclient.KubeletClient
 
 	metricSink *metrics.EntityMetricSink
 
@@ -96,6 +97,7 @@ func (m *KubeletMonitor) RetrieveResourceStat() error {
 
 // Retrieve resource metrics for the given node.
 func (m *KubeletMonitor) scrapeKubelet(node *api.Node) {
+	kc := m.kubeletClient
 	ip, err := util.GetNodeIPForMonitor(node, types.KubeletSource)
 	if err != nil {
 		glog.Errorf("Failed to get resource metrics from %s: %s", node.Name, err)
@@ -103,7 +105,7 @@ func (m *KubeletMonitor) scrapeKubelet(node *api.Node) {
 	}
 
 	// get machine information
-	machineInfo, err := m.kubeletClient.GetMachineInfo(ip)
+	machineInfo, err := kc.GetMachineInfo(ip)
 	if err != nil {
 		glog.Errorf("Failed to get machine information from %s: %s", node.Name, err)
 		return
@@ -112,16 +114,21 @@ func (m *KubeletMonitor) scrapeKubelet(node *api.Node) {
 	m.parseNodeInfo(node, machineInfo)
 
 	// get summary information about the given node and the pods running on it.
-	summary, err := m.kubeletClient.GetSummary(ip)
+	summary, err := kc.GetSummary(ip)
 	if err != nil {
 		glog.Errorf("Failed to get resource metrics summary from %s: %s", node.Name, err)
 		return
 	}
+	// Indicate that we have used the cache last time we've asked for some of the info.
+	if kc.HasCacheBeenUsed(ip) {
+		cacheUsedMetric := metrics.NewEntityStateMetric(metrics.NodeType, util.NodeKeyFunc(node), "NodeCacheUsed", 1)
+		m.metricSink.AddNewMetricEntries(cacheUsedMetric)
+	}
+
 	m.parseNodeStats(summary.Node)
 	m.parsePodStats(summary.Pods)
 
 	glog.V(4).Infof("Finished scrape node %s.", node.Name)
-
 }
 
 func (m *KubeletMonitor) parseNodeInfo(node *api.Node, machineInfo *cadvisorapi.MachineInfo) {
@@ -135,12 +142,12 @@ func (m *KubeletMonitor) parseNodeInfo(node *api.Node, machineInfo *cadvisorapi.
 func (m *KubeletMonitor) parseNodeStats(nodeStats stats.NodeStats) {
 	// cpu
 	cpuUsageCore := float64(*nodeStats.CPU.UsageNanoCores) / util.NanoToUnit
-	memoryUsageKiloBytes := float64(*nodeStats.Memory.UsageBytes) / util.KilobytesToBytes
+	memoryWorkingSetKiloBytes := float64(*nodeStats.Memory.WorkingSetBytes) / util.KilobytesToBytes
 
 	key := util.NodeStatsKeyFunc(nodeStats)
-	glog.V(3).Infof("CPU usage of node %s is %.3f core", nodeStats.NodeName, cpuUsageCore)
-	glog.V(3).Infof("Memory usage of node %s is %.3f KB", nodeStats.NodeName, memoryUsageKiloBytes)
-	m.genUsedMetrics(metrics.NodeType, key, cpuUsageCore, memoryUsageKiloBytes)
+	glog.V(4).Infof("CPU usage of node %s is %.3f core", nodeStats.NodeName, cpuUsageCore)
+	glog.V(4).Infof("Memory working set of node %s is %.3f KB", nodeStats.NodeName, memoryWorkingSetKiloBytes)
+	m.genUsedMetrics(metrics.NodeType, key, cpuUsageCore, memoryWorkingSetKiloBytes)
 }
 
 // Parse pod stats for every pod and put them into sink.
@@ -149,7 +156,7 @@ func (m *KubeletMonitor) parsePodStats(podStats []stats.PodStats) {
 		pod := &(podStats[i])
 		cpuUsed, memUsed := m.parseContainerStats(pod)
 
-		key := util.PodStatsKeyFunc(pod)
+		key := util.PodMetricId(&(pod.PodRef))
 		glog.V(4).Infof("Cpu usage of pod %s is %.3f core", key, cpuUsed)
 		glog.V(4).Infof("Memory usage of pod %s is %.3f Kb", key, memUsed)
 
@@ -163,7 +170,7 @@ func (m *KubeletMonitor) parseContainerStats(pod *stats.PodStats) (float64, floa
 	totalUsedCPU := float64(0.0)
 	totalUsedMem := float64(0.0)
 
-	podId := pod.PodRef.UID
+	podMId := util.PodMetricId(&(pod.PodRef))
 	containers := pod.Containers
 
 	for i := range containers {
@@ -171,25 +178,25 @@ func (m *KubeletMonitor) parseContainerStats(pod *stats.PodStats) (float64, floa
 		if container.CPU == nil || container.CPU.UsageNanoCores == nil {
 			continue
 		}
-		if container.Memory == nil || container.Memory.UsageBytes == nil {
+		if container.Memory == nil || container.Memory.WorkingSetBytes == nil {
 			continue
 		}
 
 		cpuUsed := float64(*(container.CPU.UsageNanoCores)) / util.NanoToUnit
-		memUsed := float64(*(container.Memory.UsageBytes)) / util.KilobytesToBytes
+		memUsed := float64(*(container.Memory.WorkingSetBytes)) / util.KilobytesToBytes
 
 		totalUsedCPU += cpuUsed
 		totalUsedMem += memUsed
 
 		//1. container Used
-		containerId := util.ContainerIdFunc(podId, i)
-		m.genUsedMetrics(metrics.ContainerType, containerId, cpuUsed, memUsed)
+		containerMId := util.ContainerMetricId(podMId, container.Name)
+		m.genUsedMetrics(metrics.ContainerType, containerMId, cpuUsed, memUsed)
 
 		glog.V(4).Infof("container[%s-%s] cpu/memory usage:%.3f, %.3f", pod.PodRef.Name, container.Name, cpuUsed, memUsed)
 
 		//2. app Used
-		appId := util.ApplicationIdFunc(containerId)
-		m.genUsedMetrics(metrics.ApplicationType, appId, cpuUsed, memUsed)
+		appMId := util.ApplicationMetricId(containerMId)
+		m.genUsedMetrics(metrics.ApplicationType, appMId, cpuUsed, memUsed)
 	}
 
 	return totalUsedCPU, totalUsedMem

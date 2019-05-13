@@ -1,7 +1,7 @@
 package property
 
 import (
-	api "k8s.io/client-go/pkg/api/v1"
+	api "k8s.io/api/core/v1"
 
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 )
@@ -24,7 +24,7 @@ func GetNodeNameFromProperty(properties []*proto.EntityDTO_EntityProperty) (node
 		return
 	}
 	for _, property := range properties {
-		if property.GetNamespace() != k8sNamespace {
+		if property.GetNamespace() != k8sPropertyNamespace {
 			continue
 		}
 		if property.GetName() == k8sNodeName {

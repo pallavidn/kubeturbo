@@ -60,31 +60,42 @@ func NewKubeEntity(entityType metrics.DiscoveredEntityType,
 func (entity *KubeEntity) String() string {
 	var buffer bytes.Buffer
 	var line string
-	line = fmt.Sprintf("Type:%s %s::%s::%s::%s\n", entity.EntityType,
-		entity.ClusterName, entity.Namespace, entity.Name, entity.UID)
+	line = fmt.Sprintf("%s %s::%s\n", entity.EntityType, entity.Name, entity.UID)
 	buffer.WriteString(line)
-	for _, resource := range entity.AllocationResources {
-		line := fmt.Sprintf("\tallocation resource:%s Capacity=%f, Used=%f\n",
-			resource.Type, resource.Capacity, resource.Used)
-		buffer.WriteString(line)
-	}
-	for _, resource := range entity.ComputeResources {
-		line := fmt.Sprintf("\tcompute resource:%s Capacity=%f, Used=%f\n",
-			resource.Type, resource.Capacity, resource.Used)
-		buffer.WriteString(line)
-	}
-	for _, provider := range entity.ProviderMap {
-		line := fmt.Sprintf("\tprovider:%s:%s\n", provider.EntityType, provider.UID)
-		buffer.WriteString(line)
-		for _, resource := range provider.BoughtCompute {
-			line := fmt.Sprintf("\t\tcompute bought:%s Used=%f\n",
-				resource.Type, resource.Used)
+	line = fmt.Sprintf("Cluster:%s Namespace:%s\n", entity.ClusterName, entity.Namespace)
+	buffer.WriteString(line)
+	if len(entity.AllocationResources) > 0 {
+		buffer.WriteString("Allocation resource:\n")
+		for _, resource := range entity.AllocationResources {
+			line := fmt.Sprintf("\t%s Capacity=%f, Used=%f\n",
+				resource.Type, resource.Capacity, resource.Used)
 			buffer.WriteString(line)
 		}
-		for _, resource := range provider.BoughtAllocation {
-			line := fmt.Sprintf("\t\tallocation bought:%s Used=%f\n",
-				resource.Type, resource.Used)
+	}
+	if len(entity.ComputeResources) > 0 {
+		buffer.WriteString("Compute resource:\n")
+		for _, resource := range entity.ComputeResources {
+			line := fmt.Sprintf("\t%s Capacity=%f, Used=%f\n",
+				resource.Type, resource.Capacity, resource.Used)
 			buffer.WriteString(line)
+		}
+	}
+	for _, provider := range entity.ProviderMap {
+		line := fmt.Sprintf("Provider:%s:%s\n", provider.EntityType, provider.UID)
+		buffer.WriteString(line)
+		if len(provider.BoughtCompute) > 0 {
+			buffer.WriteString("\tCompute bought:\n")
+			for _, resource := range provider.BoughtCompute {
+				line := fmt.Sprintf("\t\t%s Used=%f\n", resource.Type, resource.Used)
+				buffer.WriteString(line)
+			}
+		}
+		if len(provider.BoughtAllocation) > 0 {
+			buffer.WriteString("\tAllocation bought:\n")
+			for _, resource := range provider.BoughtAllocation {
+				line := fmt.Sprintf("\t\t%s Used=%f\n", resource.Type, resource.Used)
+				buffer.WriteString(line)
+			}
 		}
 	}
 	return buffer.String()
@@ -94,7 +105,7 @@ func (kubeEntity *KubeEntity) AddResource(resourceType metrics.ResourceType,
 	capValue, usedValue float64) {
 	if metrics.IsComputeType(resourceType) {
 		kubeEntity.AddComputeResource(resourceType, capValue, usedValue)
-	} else if metrics.IsAllocationType(resourceType) {
+	} else if metrics.IsQuotaType(resourceType) {
 		kubeEntity.AddAllocationResource(resourceType, capValue, usedValue)
 	}
 }
@@ -103,7 +114,7 @@ func (kubeEntity *KubeEntity) GetResource(resourceType metrics.ResourceType,
 ) (*KubeDiscoveredResource, error) {
 	if metrics.IsComputeType(resourceType) {
 		return kubeEntity.GetComputeResource(resourceType)
-	} else if metrics.IsAllocationType(resourceType) {
+	} else if metrics.IsQuotaType(resourceType) {
 		return kubeEntity.GetAllocationResource(resourceType)
 	}
 	return nil, fmt.Errorf("%s: invalid resource %s\n", kubeEntity.Name, resourceType)
@@ -111,7 +122,7 @@ func (kubeEntity *KubeEntity) GetResource(resourceType metrics.ResourceType,
 
 func (kubeEntity *KubeEntity) SetResourceCapacity(resourceType metrics.ResourceType,
 	computeCap float64) error {
-	resource, err := getResource(resourceType, kubeEntity.ComputeResources)
+	resource, err := kubeEntity.GetResource(resourceType)
 	if err != nil {
 		return err
 	}
@@ -121,7 +132,7 @@ func (kubeEntity *KubeEntity) SetResourceCapacity(resourceType metrics.ResourceT
 
 func (kubeEntity *KubeEntity) SetResourceUsed(resourceType metrics.ResourceType,
 	computeUsed float64) error {
-	resource, err := getResource(resourceType, kubeEntity.ComputeResources)
+	resource, err := kubeEntity.GetResource(resourceType)
 	if err != nil {
 		return err
 	}
@@ -129,6 +140,7 @@ func (kubeEntity *KubeEntity) SetResourceUsed(resourceType metrics.ResourceType,
 	return nil
 }
 
+// Create the KubeDiscoveredResource for the given compute resource type
 func (kubeEntity *KubeEntity) AddComputeResource(resourceType metrics.ResourceType,
 	computeCap, computeUsed float64) {
 	r := &KubeDiscoveredResource{
@@ -138,6 +150,7 @@ func (kubeEntity *KubeEntity) AddComputeResource(resourceType metrics.ResourceTy
 	kubeEntity.ComputeResources[resourceType] = r
 }
 
+// Create the KubeDiscoveredResource for the given allocation resource type
 func (kubeEntity *KubeEntity) AddAllocationResource(resourceType metrics.ResourceType,
 	capValue, usedValue float64) {
 	r := &KubeDiscoveredResource{
@@ -196,7 +209,7 @@ func (kubeEntity *KubeEntity) AddProviderResource(providerType metrics.Discovere
 	}
 	if metrics.IsComputeType(resourceType) {
 		provider.BoughtCompute[resourceType] = kubeResource
-	} else if metrics.IsAllocationType(resourceType) {
+	} else if metrics.IsQuotaType(resourceType) {
 		provider.BoughtAllocation[resourceType] = kubeResource
 	}
 }
@@ -215,7 +228,7 @@ func (kubeEntity *KubeEntity) GetBoughtResource(providerId string,
 	var resourceMap map[metrics.ResourceType]*KubeBoughtResource
 	if metrics.IsComputeType(resourceType) {
 		resourceMap = provider.BoughtCompute
-	} else if metrics.IsAllocationType(resourceType) {
+	} else if metrics.IsQuotaType(resourceType) {
 		resourceMap = provider.BoughtAllocation
 	}
 	resource, exists := resourceMap[resourceType]

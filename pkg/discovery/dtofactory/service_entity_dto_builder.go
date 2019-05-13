@@ -1,7 +1,7 @@
 package dtofactory
 
 import (
-	api "k8s.io/client-go/pkg/api/v1"
+	api "k8s.io/api/core/v1"
 
 	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
 
@@ -10,6 +10,8 @@ import (
 
 	"fmt"
 	"github.com/golang/glog"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
+	"strings"
 )
 
 const (
@@ -18,7 +20,8 @@ const (
 
 var (
 	commodityTypeBetweenAppAndService map[proto.CommodityDTO_CommodityType]struct{} = map[proto.CommodityDTO_CommodityType]struct{}{
-		proto.CommodityDTO_TRANSACTION: struct{}{},
+		proto.CommodityDTO_TRANSACTION:   struct{}{},
+		proto.CommodityDTO_RESPONSE_TIME: struct{}{},
 	}
 )
 
@@ -47,10 +50,15 @@ func (builder *ServiceEntityDTOBuilder) BuildSvcEntityDTO(servicePodMap map[*api
 		}
 		ebuilder.VirtualApplicationData(vAppData)
 
+		// set the ip property for stitching
+		ebuilder.WithProperty(getIPProperty(pods))
+
+		ebuilder.WithPowerState(proto.EntityDTO_POWERED_ON)
+
 		//3. create it
 		entityDto, err := ebuilder.Create()
 		if err != nil {
-			glog.Errorf("failed to create service[%s] EntityDTO: %v", serviceName, err)
+			glog.Errorf("failed to create service[%s] EntityDTO: %v", displayName, err)
 			continue
 		}
 		result = append(result, entityDto)
@@ -60,7 +68,7 @@ func (builder *ServiceEntityDTOBuilder) BuildSvcEntityDTO(servicePodMap map[*api
 }
 
 func (builder *ServiceEntityDTOBuilder) createCommodityBought(ebuilder *sdkbuilder.EntityDTOBuilder, pods []*api.Pod, appDTOs map[string]*proto.EntityDTO) error {
-
+	foundProvider := false
 	for _, pod := range pods {
 		podId := string(pod.UID)
 		for i := range pod.Spec.Containers {
@@ -81,7 +89,14 @@ func (builder *ServiceEntityDTOBuilder) createCommodityBought(ebuilder *sdkbuild
 			}
 			provider := sdkbuilder.CreateProvider(proto.EntityDTO_APPLICATION, appId)
 			ebuilder.Provider(provider).BuysCommodities(bought)
+			foundProvider = true
 		}
+	}
+
+	if !foundProvider {
+		err := fmt.Errorf("Failed to found any provider for service")
+		glog.Warning(err.Error())
+		return err
 	}
 
 	return nil
@@ -92,10 +107,12 @@ func (svcEntityDTOBuilder *ServiceEntityDTOBuilder) getCommoditiesBought(appDTO 
 	var commoditiesBoughtFromApp []*proto.CommodityDTO
 	for _, commSold := range commoditiesSoldByApp {
 		if _, exist := commodityTypeBetweenAppAndService[commSold.GetCommodityType()]; exist {
-			commBoughtByService, err := sdkbuilder.NewCommodityDTOBuilder(commSold.GetCommodityType()).
-				Key(commSold.GetKey()).
-				Used(commSold.GetUsed()).
-				Create()
+			commBuilder := sdkbuilder.NewCommodityDTOBuilder(commSold.GetCommodityType()).
+				Key(commSold.GetKey())
+			if commSold.Used != nil {
+				commBuilder.Used(commSold.GetUsed())
+			}
+			commBoughtByService, err := commBuilder.Create()
 			if err != nil {
 				return nil, err
 			}
@@ -108,4 +125,22 @@ func (svcEntityDTOBuilder *ServiceEntityDTOBuilder) getCommoditiesBought(appDTO 
 	}
 
 	return commoditiesBoughtFromApp, nil
+}
+
+// Get the IP property of the vApp for stitching purpose
+func getIPProperty(pods []*api.Pod) *proto.EntityDTO_EntityProperty {
+	ns := stitching.DefaultPropertyNamespace
+	attr := stitching.AppStitchingAttr
+	ips := []string{}
+	for _, pod := range pods {
+		ips = append(ips, vAppPrefix+"-"+pod.Status.PodIP)
+	}
+	ip := strings.Join(ips, ",")
+	ipProperty := &proto.EntityDTO_EntityProperty{
+		Namespace: &ns,
+		Name:      &attr,
+		Value:     &ip,
+	}
+
+	return ipProperty
 }

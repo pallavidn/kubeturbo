@@ -1,25 +1,36 @@
 package util
 
 import (
+	"strconv"
+	"strings"
+
 	"github.com/golang/glog"
 	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
-	"strconv"
 
 	"fmt"
-	api "k8s.io/client-go/pkg/api/v1"
+
+	api "k8s.io/api/core/v1"
 )
 
 const (
 	appIdPrefix = "App"
+	vdcPrefix   = "k8s-vdc"
 )
 
-// PodStatsKeyFunc and PodKeyFunc should return the same value.
-func PodStatsKeyFunc(podStat *stats.PodStats) string {
-	return podStat.PodRef.Namespace + "/" + podStat.PodRef.Name
+func PodMetricId(pod *stats.PodReference) string {
+	return pod.Namespace + "/" + pod.Name
 }
 
-func ContainerStatNameFunc(pod *stats.PodStats, containerName string) string {
-	return PodStatsKeyFunc(pod) + "/" + containerName
+func PodMetricIdAPI(pod *api.Pod) string {
+	return pod.Namespace + "/" + pod.Name
+}
+
+func ContainerMetricId(podMId string, containerName string) string {
+	return podMId + "/" + containerName
+}
+
+func ApplicationMetricId(containerMId string) string {
+	return appIdPrefix + "-" + containerMId
 }
 
 func PodKeyFunc(pod *api.Pod) string {
@@ -40,7 +51,7 @@ func ParseContainerId(containerId string) (string, int, error) {
 	}
 
 	if i < 1 {
-		err := fmt.Errorf("failed to parse containerId: %s.", containerId)
+		err := fmt.Errorf("failed to parse containerId: %s", containerId)
 		glog.Error(err)
 		return "", -1, err
 	}
@@ -57,18 +68,26 @@ func ParseContainerId(containerId string) (string, int, error) {
 	return podId, index, nil
 }
 
-// Application's displayName = "App-namespace/podName"
+// Application's displayName = "App-namespace/podName/containerName"
 //podFullName should be "namespace/podName"
-func ApplicationDisplayName(podFullName string) string {
-	return fmt.Sprintf("%s-%s", appIdPrefix, podFullName)
+func ApplicationDisplayName(podFullName, containerName string) string {
+	return fmt.Sprintf("%s-%s/%s", appIdPrefix, podFullName, containerName)
 }
 
 func GetPodFullNameFromAppName(appName string) string {
 	i := len(appIdPrefix) + 1
 	if len(appName) < i+1 {
+		glog.Errorf("Invalid appName: %v", appName)
 		return ""
 	}
-	return appName[i:]
+
+	j := strings.LastIndex(appName, "/")
+	if j <= i {
+		glog.Errorf("Invalid appName: %v", appName)
+		return ""
+	}
+
+	return appName[i:j]
 }
 
 func ApplicationIdFunc(containerId string) string {
@@ -113,4 +132,8 @@ func NodeKeyFunc(node *api.Node) string {
 
 func NodeKeyFromPodFunc(pod *api.Pod) string {
 	return pod.Spec.NodeName
+}
+
+func VDCIdFunc(namespaceId string) string {
+	return fmt.Sprintf("%s-%s", vdcPrefix, namespaceId)
 }

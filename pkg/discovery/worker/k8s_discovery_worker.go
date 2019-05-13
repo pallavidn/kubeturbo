@@ -15,6 +15,7 @@ import (
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 
 	"github.com/golang/glog"
+	api "k8s.io/api/core/v1"
 )
 
 const (
@@ -23,8 +24,6 @@ const (
 )
 
 type k8sDiscoveryWorkerConfig struct {
-	//k8sClusterScraper *cluster.ClusterScraper
-
 	// a collection of all configs for building different monitoring clients.
 	// key: monitor type; value: monitor worker config.
 	monitoringSourceConfigs map[types.MonitorType][]monitoring.MonitorWorkerConfig
@@ -134,6 +133,11 @@ func (worker *k8sDiscoveryWorker) executeTask(currTask *task.Task) *task.TaskRes
 		return task.NewTaskResult(worker.id, task.TaskFailed).WithErr(err)
 	}
 
+	if glog.V(4) {
+		for _, node := range currTask.NodeList() {
+			glog.Infof("%s : Node %s with %d pods\n", worker.id, node.Name, len(currTask.PodList()))
+		}
+	}
 	// wait group to make sure metrics scraping finishes.
 	var wg sync.WaitGroup
 	timeout := calcTimeOut(len(currTask.NodeList()))
@@ -191,14 +195,12 @@ func (worker *k8sDiscoveryWorker) executeTask(currTask *task.Task) *task.TaskRes
 
 	// Collect usages for pods in different quotas and create used and capacity
 	// metrics for the allocation resources of the nodes, quotas and pods
-	metricsCollector := &MetricsCollector{
-		NodeList:    currTask.NodeList(),
-		PodList:     currTask.PodList(),
-		Cluster:     currTask.Cluster(),
-		MetricsSink: worker.sink,
-	}
+	metricsCollector := NewMetricsCollector(worker, currTask)
 
-	podMetricsCollection := metricsCollector.CollectPodMetrics()
+	podMetricsCollection, err := metricsCollector.CollectPodMetrics()
+	if err != nil {
+		return task.NewTaskResult(worker.id, task.TaskFailed).WithErr(err)
+	}
 	nodeMetricsCollection := metricsCollector.CollectNodeMetrics(podMetricsCollection)
 	quotaMetricsCollection := metricsCollector.CollectQuotaMetrics(podMetricsCollection)
 
@@ -206,15 +208,26 @@ func (worker *k8sDiscoveryWorker) executeTask(currTask *task.Task) *task.TaskRes
 	worker.addPodAllocationMetrics(podMetricsCollection)
 	worker.addNodeAllocationMetrics(nodeMetricsCollection)
 
+	// Build Entity groups
+	groupsCollector := NewGroupMetricsCollector(worker, currTask)
+	entityGroups, _ := groupsCollector.CollectGroupMetrics()
+
 	// Build DTOs after getting the metrics
 	entityDTOs, err := worker.buildDTOs(currTask)
 	if err != nil {
 		return task.NewTaskResult(worker.id, task.TaskFailed).WithErr(err)
 	}
+	// Uncomment this to dump the topology to a file for later use by the unit tests
+	// util.DumpTopology(currTask, "test-topology.dat")
+
+	// Task result with node and pod resource metrics, quota metrics and policy groups
 	result := task.NewTaskResult(worker.id, task.TaskSucceeded).WithContent(entityDTOs)
 	// return the quota metrics created by this worker
 	if len(quotaMetricsCollection) > 0 {
 		result.WithQuotaMetrics(quotaMetricsCollection)
+	}
+	if len(entityGroups) > 0 {
+		result.WithEntityGroups(entityGroups)
 	}
 	return result
 }
@@ -232,8 +245,8 @@ func (worker *k8sDiscoveryWorker) addPodAllocationMetrics(podMetricsCollection P
 						podKey, resourceType,
 						metrics.Used, usedValue)
 					worker.sink.AddNewMetricEntries(allocationUsedMetric)
-					glog.V(4).Infof("%s: created bought allocation %s --> used=%f\n",
-						podMetrics.PodName, allocationUsedMetric.GetUID(), usedValue)
+					glog.V(4).Infof("Created %s used for pod %s:  %f.",
+						allocationUsedMetric.GetUID(), podMetrics.PodName, usedValue)
 				}
 
 				for resourceType, capValue := range podMetrics.ComputeCapacity {
@@ -241,8 +254,8 @@ func (worker *k8sDiscoveryWorker) addPodAllocationMetrics(podMetricsCollection P
 						podKey, resourceType,
 						metrics.Capacity, capValue)
 					worker.sink.AddNewMetricEntries(computeCapMetric)
-					glog.V(4).Infof("%s: updated compute capacity %s --> cap=%f\n",
-						podMetrics.PodName, computeCapMetric.GetUID(), capValue)
+					glog.V(4).Infof("Updated %s capacity for pod %s: %f.",
+						computeCapMetric.GetUID(), podMetrics.PodName, capValue)
 				}
 			}
 		}
@@ -253,7 +266,7 @@ func (worker *k8sDiscoveryWorker) addNodeAllocationMetrics(nodeMetricsCollection
 	entityType := metrics.NodeType
 	for _, nodeMetrics := range nodeMetricsCollection {
 		nodeKey := nodeMetrics.NodeKey
-		for _, allocationResource := range metrics.ComputeAllocationResources {
+		for _, allocationResource := range metrics.QuotaResources {
 			capValue := nodeMetrics.AllocationCap[allocationResource]
 			allocationCapMetric := metrics.NewEntityResourceMetric(entityType, nodeKey,
 				allocationResource, metrics.Capacity, capValue)
@@ -264,8 +277,8 @@ func (worker *k8sDiscoveryWorker) addNodeAllocationMetrics(nodeMetricsCollection
 				allocationResource, metrics.Used, usedValue)
 			worker.sink.AddNewMetricEntries(allocationUsedMetric)
 
-			glog.V(4).Infof("Node:%s : created allocation sold %s --> cap=%f  used=%f\n",
-				nodeMetrics.NodeName, allocationResource, capValue, usedValue)
+			glog.V(4).Infof("Created %s sold for node %s, used: %f, cap: %f.",
+				allocationResource, nodeMetrics.NodeName, usedValue, capValue)
 		}
 	}
 }
@@ -280,8 +293,14 @@ func (worker *k8sDiscoveryWorker) buildDTOs(currTask *task.Task) ([]*proto.Entit
 	// Node providers
 	nodes := currTask.NodeList()
 	cluster := currTask.Cluster()
+
 	for _, node := range nodes {
-		stitchingManager.StoreStitchingValue(node)
+		if node != nil {
+			glog.V(3).Infof("The node we are parsing is : %v", node.Name)
+			providerId := node.Spec.ProviderID
+			stitchingManager.SetNodeUuidGetterByProvider(providerId)
+			stitchingManager.StoreStitchingValue(node)
+		}
 	}
 
 	//1. build entityDTOs for nodes
@@ -302,6 +321,8 @@ func (worker *k8sDiscoveryWorker) buildDTOs(currTask *task.Task) ([]*proto.Entit
 		nodeNameUIDMap = cluster.NodeNameUIDMap   // node providers
 	}
 	pods := currTask.PodList()
+	glog.V(3).Infof("Worker %s receives %d pods.", worker.id, len(pods))
+
 	podEntityDTOBuilder := dtofactory.NewPodEntityDTOBuilder(worker.sink, stitchingManager,
 		nodeNameUIDMap, quotaNameUIDMap)
 	podEntityDTOs, err := podEntityDTOBuilder.BuildEntityDTOs(pods)
@@ -311,9 +332,14 @@ func (worker *k8sDiscoveryWorker) buildDTOs(currTask *task.Task) ([]*proto.Entit
 	result = append(result, podEntityDTOs...)
 	glog.V(3).Infof("Worker %s builds %d pod entityDTOs.", worker.id, len(podEntityDTOs))
 
+	// Filter out pods that build DTO failed so
+	// building container and app DTOs will not include them
+	pods = excludeFailedPods(pods, podEntityDTOs)
+
 	//3. build entityDTOs for containers
 	containerDTOBuilder := dtofactory.NewContainerDTOBuilder(worker.sink)
 	containerDTOs, err := containerDTOBuilder.BuildDTOs(pods)
+	//util.DumpTopology(containerDTOs, "test-topology.dat")
 	if err != nil {
 		glog.Errorf("Error while createing container entityDTOs: %v", err)
 	}
@@ -343,4 +369,18 @@ func calcTimeOut(nodeNum int) time.Duration {
 	}
 
 	return result
+}
+
+// excludeFailedPods filters the pod list and excludes those pods not in the dto list
+func excludeFailedPods(pods []*api.Pod, dtos []*proto.EntityDTO) []*api.Pod {
+	m := map[string]*api.Pod{}
+	for _, pod := range pods {
+		m[string(pod.UID)] = pod
+	}
+
+	for i, dto := range dtos {
+		pods[i] = m[dto.GetId()]
+	}
+
+	return pods[:len(dtos)]
 }
