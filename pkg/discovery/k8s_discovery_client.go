@@ -149,6 +149,11 @@ func (dc *K8sDiscoveryClient) Discover(accountValues []*proto.AccountValue) (*pr
 		EntityDTO:       newDiscoveryResultDTOs,
 	}
 
+	discoveryResponse.DiscActionSpec = &proto.DiscoveredActionSpec{
+		Specs: []*proto.ActionMergeSpec{},
+		XXX_unrecognized: nil,
+	}
+
 	newFrameworkDiscTime := time.Now().Sub(currentTime).Seconds()
 	glog.V(2).Infof("Successfully discovered kubernetes cluster in %.3f seconds", newFrameworkDiscTime)
 
