@@ -1,6 +1,7 @@
 package mediationcontainer
 
 import (
+	"github.com/golang/glog"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 )
 
@@ -30,6 +31,32 @@ func (d *DiscoveryResponseSender) Send(discoveryResponse *proto.DiscoveryRespons
 // will be generated and sent. This is required to get the DTOs passed at server side.
 func (d *DiscoveryResponseSender) chunkDiscoveryResponse(dr *proto.DiscoveryResponse) []*proto.DiscoveryResponse {
 	chunks := []*proto.DiscoveryResponse{}
+	//ver := "version1"
+	//chunk := &proto.DiscoveryResponse{
+	//	PriceTable: &proto.PriceTable{
+	//		Version:                   &ver,
+	//		PriceTableKeys:             nil,
+	//		OnDemandPriceTable:         nil,
+	//		SpotPriceTable:             nil,
+	//		ReservedInstancePriceTable: nil,
+	//		OnDemandLicensePriceTable:  nil,
+	//		ReservedLicensePriceTable:  nil,
+	//		ServiceProviderId:          nil,
+	//		XXX_unrecognized:           nil,
+	//	},
+	//}
+	//
+	//chunks = append(chunks, chunk)
+
+	if dr.DiscActionSpec != nil {
+		glog.Infof("Adding DiscActionSpec to the response ... %++v", dr.DiscActionSpec)
+		chunk := &proto.DiscoveryResponse{
+			DiscActionSpec: &proto.DiscoveredActionSpec{
+				Specs:            dr.DiscActionSpec.Specs,
+			},
+		}
+		chunks = append(chunks, chunk)
+	}
 
 	if len(dr.EntityDTO) > 0 {
 		chunk := &proto.DiscoveryResponse{

@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"fmt"
+	protobuf "github.com/golang/protobuf/proto"
 	"time"
 
 	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
@@ -139,7 +140,7 @@ func (dc *K8sDiscoveryClient) Validate(accountValues []*proto.AccountValue) (*pr
 func (dc *K8sDiscoveryClient) Discover(accountValues []*proto.AccountValue) (*proto.DiscoveryResponse, error) {
 	glog.V(2).Infof("Discovering kubernetes cluster...")
 	currentTime := time.Now()
-	newDiscoveryResultDTOs, groupDTOs, err := dc.discoverWithNewFramework()
+	newDiscoveryResultDTOs, groupDTOs, actionSpecDTOs, err := dc.discoverWithNewFramework()
 	if err != nil {
 		glog.Errorf("Failed to discover kubernetes cluster: %v", err)
 	}
@@ -147,15 +148,12 @@ func (dc *K8sDiscoveryClient) Discover(accountValues []*proto.AccountValue) (*pr
 	discoveryResponse := &proto.DiscoveryResponse{
 		DiscoveredGroup: groupDTOs,
 		EntityDTO:       newDiscoveryResultDTOs,
-	}
-
-	discoveryResponse.DiscActionSpec = &proto.DiscoveredActionSpec{
-		Specs: []*proto.ActionMergeSpec{},
-		XXX_unrecognized: nil,
+		Specs:           actionSpecDTOs,
 	}
 
 	newFrameworkDiscTime := time.Now().Sub(currentTime).Seconds()
 	glog.V(2).Infof("Successfully discovered kubernetes cluster in %.3f seconds", newFrameworkDiscTime)
+	glog.Infof("SPEC DTO: %++v", protobuf.MarshalTextString(discoveryResponse))
 
 	return discoveryResponse, nil
 }
@@ -163,11 +161,11 @@ func (dc *K8sDiscoveryClient) Discover(accountValues []*proto.AccountValue) (*pr
 /*
 	The actual discovery work is done here.
 */
-func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []*proto.GroupDTO, error) {
+func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []*proto.GroupDTO, []*proto.ActionMergeSpec, error) {
 	// CREATE CLUSTER, NODES, NAMESPACES, QUOTAS, SERVICES HERE
 	kubeCluster, err := dc.clusterProcessor.DiscoverCluster()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to process cluster: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to process cluster: %v", err)
 	}
 	clusterSummary := repository.CreateClusterSummary(kubeCluster)
 
@@ -248,5 +246,10 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []
 	}
 
 	groupDTOs = append(groupDTOs, nodeAntiAffinityGroupDTOs...)
-	return entityDTOs, groupDTOs, nil
+
+	// Discovery worker for creating Group DTOs
+	actionSpecWorker := worker.Newk8sActionSpecWorker(clusterSummary, targetId)
+	actionSpecDTOs, _ := actionSpecWorker.Do(policyGroupList)
+
+	return entityDTOs, groupDTOs, actionSpecDTOs, nil
 }

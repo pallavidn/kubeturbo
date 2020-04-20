@@ -10,6 +10,9 @@ import (
 )
 
 // Collects parent info for the pods and containers and converts to EntityGroup objects
+// One instance of GroupMetricsCollector is created by each DiscoveryWorker, so the group information
+// is only for the pods and containers running on the nodes handled by the discovery worker.
+// The results from the different workers will be consolidated by the k8sEntityGroupDiscoveryWorker
 type GroupMetricsCollector struct {
 	PodList     []*v1.Pod
 	MetricsSink *metrics.EntityMetricSink

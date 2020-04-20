@@ -91,10 +91,10 @@ github.com/sirupsen/logrus
 github.com/spf13/pflag
 # github.com/stretchr/testify v1.3.0
 github.com/stretchr/testify/assert
-# github.com/turbonomic/turbo-api v0.0.0-20180816193551-ed948ba97e70
+# github.com/turbonomic/turbo-api v0.0.0-20200316022338-fbd613adc0eb
 github.com/turbonomic/turbo-api/pkg/api
 github.com/turbonomic/turbo-api/pkg/client
-# github.com/turbonomic/turbo-go-sdk v0.0.0-20200203194616-ace86b79207d
+# github.com/turbonomic/turbo-go-sdk v0.0.0-20200203194616-ace86b79207d => ../turbo-go-sdk
 github.com/turbonomic/turbo-go-sdk/pkg
 github.com/turbonomic/turbo-go-sdk/pkg/builder
 github.com/turbonomic/turbo-go-sdk/pkg/builder/group
@@ -106,7 +106,7 @@ github.com/turbonomic/turbo-go-sdk/pkg/supplychain
 github.com/turbonomic/turbo-go-sdk/pkg/version
 # golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2
 golang.org/x/crypto/ssh/terminal
-# golang.org/x/net v0.0.0-20190311183353-d8887717615a
+# golang.org/x/net v0.0.0-20200324143707-d3edc9973b7e
 golang.org/x/net/context
 golang.org/x/net/context/ctxhttp
 golang.org/x/net/http/httpguts
@@ -116,7 +116,7 @@ golang.org/x/net/idna
 # golang.org/x/oauth2 v0.0.0-20190402181905-9f3314589c9a
 golang.org/x/oauth2
 golang.org/x/oauth2/internal
-# golang.org/x/sys v0.0.0-20190312061237-fead79001313
+# golang.org/x/sys v0.0.0-20200323222414-85ca7c5b95cd
 golang.org/x/sys/unix
 golang.org/x/sys/windows
 # golang.org/x/text v0.3.1-0.20181227161524-e6919f6577db
