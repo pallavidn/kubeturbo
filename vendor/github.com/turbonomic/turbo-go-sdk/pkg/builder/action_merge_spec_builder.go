@@ -91,7 +91,7 @@ func (rb *ResizeMergeSpecBuilder) Build() (*proto.ActionMergeSpec, error) {
 	if len(rb.entityIDs) == 0 || rb.targetID == "" {
 		return nil, fmt.Errorf("Entity IDs or target ID required for action merge spec")
 	}
-	if (len(rb.commTypes) == 0) {
+	if len(rb.commTypes) == 0 {
 		return nil, fmt.Errorf("Commodity types required for resize merge spec")
 	}
 	mergeSpec := &proto.ActionMergeSpec{
