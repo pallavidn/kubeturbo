@@ -1,71 +1,117 @@
 package kubeturbo
 
 import (
-	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
 	"strings"
 	"testing"
+
+	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
 )
 
-func TestParseK8sTAPServiceSpec(t *testing.T) {
+func TestParseK8sTAPServiceSpecWithMissingTargetConfig(t *testing.T) {
 	defaultTargetName := "target-foo"
 	configPath := "../test/config/turbo-config"
 
-	got, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
-
+	config, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
 	if err != nil {
 		t.Fatalf("Error while parsing the spec file %s: %v", configPath, err)
 	}
 
 	// Check target config
-	checkStartWith(got.TargetType, "Kubernetes-", t)
-	checkStartWith(got.ProbeCategory, "Cloud Native", t)
-	check(got.TargetIdentifier, "Kubernetes-"+defaultTargetName, t)
-	check(got.TargetPassword, "defaultPassword", t)
-	check(got.TargetUsername, "defaultUser", t)
+	checkStartWith(config.ProbeCategory, "Cloud Native", t)
+	check(config.TargetType, "Kubernetes-"+defaultTargetName, t)
+	check(config.TargetIdentifier, "Kubernetes-"+defaultTargetName, t)
 
 	// Check comm config
-	check(got.TurboServer, "https://127.1.1.1:9444", t)
-	check(got.RestAPIConfig.OpsManagerUsername, "foo", t)
-	check(got.RestAPIConfig.OpsManagerPassword, "bar", t)
+	check(config.TurboServer, "https://127.1.1.1:9444", t)
+	check(config.OpsManagerUsername, "foo", t)
+	check(config.OpsManagerPassword, "bar", t)
 }
 
-func TestParseK8sTAPServiceSpecWithTargetConfig(t *testing.T) {
+func TestParseK8sTAPServiceSpecWithIncompleteCredential(t *testing.T) {
+	defaultTargetName := "target-foo"
+	configPath := "../test/config/turbo-config-with-incomplete-credential"
+
+	_, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
+	if err == nil {
+		t.Fatalf("Expect error from parsing %s", configPath)
+	}
+	if !strings.Contains(err.Error(), "both username and password must be provided") {
+		t.Fatalf("Expect error string to contain \"both username and password must be provided\"")
+	}
+}
+
+func TestParseK8sTAPServiceSpecWithEmptyTargetConfig(t *testing.T) {
+	defaultTargetName := "target-foo"
+	configPath := "../test/config/turbo-config-with-empty-targetconfig"
+
+	config, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
+	if err != nil {
+		t.Fatalf("Error while parsing the spec file %s: %v", configPath, err)
+	}
+
+	// Check target config
+	checkStartWith(config.ProbeCategory, "Cloud Native", t)
+	check(config.TargetType, "Kubernetes-"+defaultTargetName, t)
+	check(config.TargetIdentifier, "Kubernetes-"+defaultTargetName, t)
+}
+
+func TestParseK8sTAPServiceSpecWithTargetType(t *testing.T) {
+	defaultTargetName := "target-foo"
+	configPath := "../test/config/turbo-config-with-target-type"
+
+	config, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
+	if err != nil {
+		t.Fatalf("Error while parsing the spec file %s: %v", configPath, err)
+	}
+
+	// Check target config
+	checkStartWith(config.ProbeCategory, "Cloud Native", t)
+	check(config.TargetType, "Kubernetes-cluster-foo", t)
+	check(config.TargetIdentifier, "", t)
+
+	// Check comm config
+	check(config.TurboServer, "https://127.1.1.1:9444", t)
+	check(config.OpsManagerUsername, "foo", t)
+	check(config.OpsManagerPassword, "bar", t)
+}
+
+func TestParseK8sTAPServiceSpecWithTargetName(t *testing.T) {
 	defaultTargetName := "target-foo"
 	configPath := "../test/config/turbo-config-with-target-name"
 
-	got, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
-
+	config, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
 	if err != nil {
 		t.Fatalf("Error while parsing the spec file %s: %v", configPath, err)
 	}
 
 	// Check target config
-	checkStartWith(got.TargetType, "Kubernetes-", t)
-	checkStartWith(got.ProbeCategory, "Cloud Native", t)
+	checkStartWith(config.ProbeCategory, "Cloud Native", t)
 	// The target name should be the one from the config file
-	check(got.TargetIdentifier, "Kubernetes-cluster-foo", t)
-	check(got.TargetPassword, "defaultPassword", t)
-	check(got.TargetUsername, "defaultUser", t)
+	check(config.TargetType, "Kubernetes-cluster-foo", t)
+	check(config.TargetIdentifier, "Kubernetes-cluster-foo", t)
+	check(config.OpsManagerUsername, "foo", t)
+	check(config.OpsManagerPassword, "bar", t)
 }
 
-func TestParseK8sTAPServiceSpecWithOldConfig(t *testing.T) {
+func TestParseK8sTAPServiceSpecWithTargetNameAndTargetType(t *testing.T) {
 	defaultTargetName := "target-foo"
-	configPath := "../test/config/turbo-config-old"
+	configPath := "../test/config/turbo-config-with-target-name-and-target-type"
 
-	got, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
+	config, err := ParseK8sTAPServiceSpec(configPath, defaultTargetName)
 
 	if err != nil {
 		t.Fatalf("Error while parsing the spec file %s: %v", configPath, err)
 	}
 
 	// Check target config
-	checkStartWith(got.TargetType, "tt1", t)
-	checkStartWith(got.ProbeCategory, "pc1", t)
-	check(got.TargetIdentifier, "Kubernetes-addr1", t)
-	// The files of username and password are ignored when parsing the json file
-	check(got.TargetPassword, "defaultPassword", t)
-	check(got.TargetUsername, "defaultUser", t)
+	checkStartWith(config.ProbeCategory, "Cloud Native", t)
+	// The target name should be the one from the config file
+	check(config.TargetType, "Kubernetes-Openshift", t)
+	check(config.TargetIdentifier, "Kubernetes-cluster-foo", t)
+	check(config.OpsManagerUsername, "foo", t)
+	check(config.OpsManagerPassword, "bar", t)
+
 }
 
 func check(got, want string, t *testing.T) {

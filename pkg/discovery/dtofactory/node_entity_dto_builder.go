@@ -9,7 +9,6 @@ import (
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
-
 	sdkbuilder "github.com/turbonomic/turbo-go-sdk/pkg/builder"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 
@@ -19,8 +18,6 @@ import (
 const (
 	accessCommodityDefaultCapacity  = 1e10
 	clusterCommodityDefaultCapacity = 1e10
-
-	schedAccessCommodityKey string = "schedulable"
 )
 
 var (
@@ -30,14 +27,23 @@ var (
 		metrics.CPURequest,
 		metrics.MemoryRequest,
 		metrics.NumPods,
+		metrics.VStorage,
 		// TODO, add back provisioned commodity later
 	}
 
 	allocationResourceCommoditiesSold = []metrics.ResourceType{
-		metrics.CPUQuota,
-		metrics.MemoryQuota,
+		metrics.CPULimitQuota,
+		metrics.MemoryLimitQuota,
 		metrics.CPURequestQuota,
 		metrics.MemoryRequestQuota,
+	}
+
+	// List of commodities and a boolean indicating if the commodity should be resized
+	resizableCommodities = map[proto.CommodityDTO_CommodityType]bool{
+		proto.CommodityDTO_VCPU:         false,
+		proto.CommodityDTO_VMEM:         false,
+		proto.CommodityDTO_VCPU_REQUEST: false,
+		proto.CommodityDTO_VMEM_REQUEST: false,
 	}
 )
 
@@ -47,7 +53,6 @@ type nodeEntityDTOBuilder struct {
 }
 
 func NewNodeEntityDTOBuilder(sink *metrics.EntityMetricSink, stitchingManager *stitching.StitchingManager) *nodeEntityDTOBuilder {
-
 	return &nodeEntityDTOBuilder{
 		generalBuilder:   newGeneralBuilder(sink),
 		stitchingManager: stitchingManager,
@@ -113,6 +118,11 @@ func (builder *nodeEntityDTOBuilder) BuildEntityDTOs(nodes []*api.Node) ([]*prot
 			Controllable: &controllable,
 		})
 
+		// Action settings for a node
+		// Allow suspend for all nodes except masters
+		isMasterNode := util.DetectMasterRole(node)
+		entityDTOBuilder.IsSuspendable(!isMasterNode)
+
 		// Power state.
 		// Will be Powered On, only if it is ready and has no issues with kubelet accessibility.
 		if nodeActive {
@@ -135,7 +145,12 @@ func (builder *nodeEntityDTOBuilder) BuildEntityDTOs(nodes []*api.Node) ([]*prot
 		}
 
 		result = append(result, entityDto)
-		glog.V(4).Infof("node dto : %++v\n", entityDto)
+
+		if isMasterNode {
+			glog.V(3).Infof("master node dto:\n	 %++v\n", entityDto)
+		} else {
+			glog.V(4).Infof("node dto : %++v\n", entityDto)
+		}
 	}
 
 	return result, nil
@@ -163,6 +178,13 @@ func (builder *nodeEntityDTOBuilder) getNodeCommoditiesSold(node *api.Node) ([]*
 	resourceCommoditiesSold, err := builder.getResourceCommoditiesSold(metrics.NodeType, key, nodeResourceCommoditiesSold, converter, nil)
 	if err != nil {
 		return nil, err
+	}
+
+	// Disable vertical resize of the resource commodities for all nodes
+	for _, commSold := range resourceCommoditiesSold {
+		if isResizeable, exists := resizableCommodities[commSold.GetCommodityType()]; exists {
+			commSold.Resizable = &isResizeable
+		}
 	}
 	commoditiesSold = append(commoditiesSold, resourceCommoditiesSold...)
 
@@ -212,12 +234,12 @@ func (builder *nodeEntityDTOBuilder) getAllocationCommoditiesSold(node *api.Node
 	if err != nil {
 		return nil, fmt.Errorf("failed to get cpu frequency from sink for node %s: %s", key, err)
 	}
-	// cpuQuota and cpuRequestQuota needs to be converted from number of cores to frequency.
+	// cpuLimitQuota and cpuRequestQuota needs to be converted from number of cores to frequency.
 	converter := NewConverter().Set(
 		func(input float64) float64 {
 			return input * cpuFrequency
 		},
-		metrics.CPUQuota, metrics.CPURequestQuota)
+		metrics.CPULimitQuota, metrics.CPURequestQuota)
 
 	// Resource Commodities
 	var resourceCommoditiesSold []*proto.CommodityDTO

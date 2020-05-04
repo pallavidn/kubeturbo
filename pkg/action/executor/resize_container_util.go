@@ -2,8 +2,9 @@ package executor
 
 import (
 	"fmt"
-	"k8s.io/client-go/dynamic"
 	"math"
+
+	"k8s.io/client-go/dynamic"
 
 	"github.com/golang/glog"
 
@@ -131,10 +132,10 @@ func updateResourceAmount(podSpec *k8sapi.PodSpec, spec *containerResizeSpec) (b
 // Generate a resource.Quantity for CPU.
 // it will convert CPU unit from MHz to CPU.core time in milliSeconds
 // @newValue is from OpsMgr, in MHz
-// @cpuFrequency is from kubeletClient, in KHz
-func genCPUQuantity(newValue float64, cpuFrequency uint64) (resource.Quantity, error) {
-	tmp := newValue * 1000 * 1000 //to KHz and to milliSeconds
-	tmp = tmp / float64(cpuFrequency)
+// @nodeCpuFrequency is from kubeletClient, in MHz
+func genCPUQuantity(newValue float64, nodeCpuFrequency float64) (resource.Quantity, error) {
+	tmp := newValue * 1000 // to milliSeconds
+	tmp = tmp / nodeCpuFrequency
 	cpuTime := int(math.Ceil(tmp))
 	if cpuTime < 1 {
 		cpuTime = 1
@@ -197,7 +198,7 @@ func resizeControllerContainer(client *kclient.Clientset, dynClient dynamic.Inte
 func resizeSingleContainer(client *kclient.Clientset, originalPod *k8sapi.Pod, spec *containerResizeSpec) (*k8sapi.Pod, error) {
 	// check parent controller of the original pod
 	fullName := util.BuildIdentifier(originalPod.Namespace, originalPod.Name)
-	parentKind, parentName, err := podutil.GetPodParentInfo(originalPod)
+	parentKind, parentName, _, err := podutil.GetPodParentInfo(originalPod)
 	if err != nil {
 		glog.Errorf("Resize action failed: failed to get pod[%s] parent info: %v.", fullName, err)
 		return nil, err

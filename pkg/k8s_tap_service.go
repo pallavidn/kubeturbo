@@ -4,23 +4,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/detectors"
 	"io/ioutil"
+	"os"
+	"strings"
 
-	restclient "k8s.io/client-go/rest"
-
+	"github.com/golang/glog"
 	"github.com/turbonomic/kubeturbo/pkg/action"
 	"github.com/turbonomic/kubeturbo/pkg/discovery"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
-	"github.com/turbonomic/kubeturbo/pkg/registration"
-
-	"github.com/turbonomic/turbo-go-sdk/pkg/probe"
-	"github.com/turbonomic/turbo-go-sdk/pkg/service"
-
-	"github.com/golang/glog"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/detectors"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/kubelet"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/master"
+	"github.com/turbonomic/kubeturbo/pkg/registration"
+	"github.com/turbonomic/turbo-go-sdk/pkg/probe"
+	"github.com/turbonomic/turbo-go-sdk/pkg/service"
+)
+
+const (
+	defaultUsername  = "defaultUser"
+	defaultPassword  = "defaultPassword"
+	usernameFilePath = "/etc/turbonomic-credentials/username"
+	passwordFilePath = "/etc/turbonomic-credentials/password"
 )
 
 type K8sTAPServiceSpec struct {
@@ -31,7 +36,7 @@ type K8sTAPServiceSpec struct {
 	*detectors.HANodeConfig           `json:"HANodeConfig,omitempty"`
 }
 
-func ParseK8sTAPServiceSpec(configFile, defaultTargetName string) (*K8sTAPServiceSpec, error) {
+func ParseK8sTAPServiceSpec(configFile string, defaultTargetName string) (*K8sTAPServiceSpec, error) {
 	// load the config
 	tapSpec, err := readK8sTAPServiceSpec(configFile)
 	if err != nil {
@@ -42,16 +47,28 @@ func ParseK8sTAPServiceSpec(configFile, defaultTargetName string) (*K8sTAPServic
 	if tapSpec.TurboCommunicationConfig == nil {
 		return nil, errors.New("communication config is missing")
 	}
+
+	if tapSpec.K8sTargetConfig == nil {
+		// The targetConfig is missing, create one
+		tapSpec.K8sTargetConfig = &configs.K8sTargetConfig{}
+	}
+
+	if tapSpec.TargetIdentifier == "" && tapSpec.TargetType == "" {
+		// Neither targetIdentifier nor targetType is specified, set a default target name
+		if defaultTargetName == "" {
+			return nil, errors.New("default target name is empty")
+		}
+		tapSpec.TargetIdentifier = defaultTargetName
+	}
+
+	if err := loadOpsMgrCredentialsFromSecret(tapSpec); err != nil {
+		return nil, err
+	}
+
 	if err := tapSpec.ValidateTurboCommunicationConfig(); err != nil {
 		return nil, err
 	}
 
-	if tapSpec.K8sTargetConfig == nil {
-		if defaultTargetName == "" {
-			return nil, errors.New("target name is empty")
-		}
-		tapSpec.K8sTargetConfig = &configs.K8sTargetConfig{TargetIdentifier: defaultTargetName}
-	}
 	if err := tapSpec.ValidateK8sTargetConfig(); err != nil {
 		return nil, err
 	}
@@ -61,6 +78,33 @@ func ParseK8sTAPServiceSpec(configFile, defaultTargetName string) (*K8sTAPServic
 		tapSpec.DaemonPodDetectors, tapSpec.HANodeConfig)
 
 	return tapSpec, nil
+}
+
+func loadOpsMgrCredentialsFromSecret(tapSpec *K8sTAPServiceSpec) error {
+	// Return unchanged if the mounted file isn't present
+	// for backward compatibility.
+	if _, err := os.Stat(usernameFilePath); os.IsNotExist(err) {
+		glog.V(3).Infof("credentials from secret unavailable. Checked path: %s", usernameFilePath)
+		return nil
+	}
+	if _, err := os.Stat(passwordFilePath); os.IsNotExist(err) {
+		glog.V(3).Infof("credentials from secret unavailable. Checked path: %s", passwordFilePath)
+		return nil
+	}
+
+	username, err := ioutil.ReadFile(usernameFilePath)
+	if err != nil {
+		return fmt.Errorf("error reading credentials from secret: username: %v", err)
+	}
+	password, err := ioutil.ReadFile(passwordFilePath)
+	if err != nil {
+		return fmt.Errorf("error reading credentials from secret: password: %v", err)
+	}
+
+	tapSpec.OpsManagerUsername = strings.TrimSpace(string(username))
+	tapSpec.OpsManagerPassword = strings.TrimSpace(string(password))
+
+	return nil
 }
 
 func readK8sTAPServiceSpec(path string) (*K8sTAPServiceSpec, error) {
@@ -76,13 +120,9 @@ func readK8sTAPServiceSpec(path string) (*K8sTAPServiceSpec, error) {
 	return &spec, nil
 }
 
-func createTargetConfig(kubeConfig *restclient.Config) *configs.K8sTargetConfig {
-	return &configs.K8sTargetConfig{TargetIdentifier: kubeConfig.Host}
-}
-
 func createProbeConfigOrDie(c *Config) *configs.ProbeConfig {
 	// Create Kubelet monitoring
-	kubeletMonitoringConfig := kubelet.NewKubeletMonitorConfig(c.KubeletClient)
+	kubeletMonitoringConfig := kubelet.NewKubeletMonitorConfig(c.KubeletClient, c.KubeClient)
 
 	// Create cluster monitoring
 	masterMonitoringConfig := master.NewClusterMonitorConfig(c.KubeClient, c.DynamicClient)
@@ -117,12 +157,13 @@ func NewKubernetesTAPService(config *Config) (*K8sTAPService, error) {
 	registrationClientConfig := registration.NewRegistrationClientConfig(config.StitchingPropType, config.VMPriority, config.VMIsBase)
 
 	probeConfig := createProbeConfigOrDie(config)
-	discoveryClientConfig := discovery.NewDiscoveryConfig(probeConfig, config.tapSpec.K8sTargetConfig, config.ValidationWorkers, config.ValidationTimeoutSec)
+	discoveryClientConfig := discovery.NewDiscoveryConfig(probeConfig, config.tapSpec.K8sTargetConfig, config.ValidationWorkers,
+		config.ValidationTimeoutSec, config.containerUtilizationDataAggStrategy, config.containerUsageDataAggStrategy)
 
 	actionHandlerConfig := action.NewActionHandlerConfig(config.CAPINamespace, config.CAClient, config.KubeClient, config.KubeletClient, config.DynamicClient, config.SccSupport)
 
 	// Kubernetes Probe Registration Client
-	registrationClient := registration.NewK8sRegistrationClient(registrationClientConfig)
+	registrationClient := registration.NewK8sRegistrationClient(registrationClientConfig, config.tapSpec.K8sTargetConfig)
 
 	// Kubernetes Probe Discovery Client
 	discoveryClient := discovery.NewK8sDiscoveryClient(discoveryClientConfig)
@@ -130,18 +171,27 @@ func NewKubernetesTAPService(config *Config) (*K8sTAPService, error) {
 	// Kubernetes Probe Action Execution Client
 	actionHandler := action.NewActionHandler(actionHandlerConfig)
 
-	// The KubeTurbo TAP Service that will register the kubernetes target with the
-	// Turbonomic server and await for validation, discovery, action execution requests
+	probeBuilder := probe.NewProbeBuilder(config.tapSpec.TargetType, config.tapSpec.ProbeCategory).
+		WithDiscoveryOptions(probe.FullRediscoveryIntervalSecondsOption(int32(config.DiscoveryIntervalSec))).
+		RegisteredBy(registrationClient).
+		WithActionPolicies(registrationClient).
+		WithEntityMetadata(registrationClient).
+		ExecutesActionsBy(actionHandler)
+
+	if len(config.tapSpec.TargetIdentifier) > 0 {
+		// The KubeTurbo TAP Service that will register the kubernetes target with the
+		// Turbonomic server and await for validation, discovery, action execution requests
+		glog.Infof("Should discover target %s", config.tapSpec.TargetIdentifier)
+		probeBuilder = probeBuilder.DiscoversTarget(config.tapSpec.TargetIdentifier, discoveryClient)
+	} else {
+		glog.Infof("Not discovering target")
+		probeBuilder = probeBuilder.WithDiscoveryClient(discoveryClient)
+	}
+
 	tapService, err :=
 		service.NewTAPServiceBuilder().
 			WithTurboCommunicator(config.tapSpec.TurboCommunicationConfig).
-			WithTurboProbe(probe.NewProbeBuilder(config.tapSpec.TargetType, config.tapSpec.ProbeCategory).
-				WithDiscoveryOptions(probe.FullRediscoveryIntervalSecondsOption(int32(config.DiscoveryIntervalSec))).
-				RegisteredBy(registrationClient).
-				WithActionPolicies(registrationClient).
-				WithEntityMetadata(registrationClient).
-				DiscoversTarget(config.tapSpec.TargetIdentifier, discoveryClient).
-				ExecutesActionsBy(actionHandler)).
+			WithTurboProbe(probeBuilder).
 			Create()
 	if err != nil {
 		return nil, err

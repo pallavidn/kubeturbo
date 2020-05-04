@@ -2,9 +2,11 @@ package registration
 
 import (
 	"fmt"
+	"testing"
+
+	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
-	"testing"
 )
 
 func xcheck(expected map[proto.ActionItemDTO_ActionType]proto.ActionPolicyDTO_ActionCapability,
@@ -32,7 +34,8 @@ func xcheck(expected map[proto.ActionItemDTO_ActionType]proto.ActionPolicyDTO_Ac
 
 func TestK8sRegistrationClient_GetActionPolicy(t *testing.T) {
 	conf := NewRegistrationClientConfig(stitching.UUID, 0, true)
-	reg := NewK8sRegistrationClient(conf)
+	targetConf := &configs.K8sTargetConfig{}
+	reg := NewK8sRegistrationClient(conf, targetConf)
 
 	supported := proto.ActionPolicyDTO_SUPPORTED
 	recommend := proto.ActionPolicyDTO_NOT_EXECUTABLE
@@ -48,6 +51,7 @@ func TestK8sRegistrationClient_GetActionPolicy(t *testing.T) {
 	resize := proto.ActionItemDTO_RIGHT_SIZE
 	provision := proto.ActionItemDTO_PROVISION
 	suspend := proto.ActionItemDTO_SUSPEND
+	scale := proto.ActionItemDTO_SCALE
 
 	expected_pod := make(map[proto.ActionItemDTO_ActionType]proto.ActionPolicyDTO_ActionCapability)
 	expected_pod[move] = supported
@@ -77,6 +81,7 @@ func TestK8sRegistrationClient_GetActionPolicy(t *testing.T) {
 	expected_node[resize] = notSupported
 	expected_node[provision] = supported
 	expected_node[suspend] = supported
+	expected_node[scale] = notSupported
 
 	policies := reg.GetActionPolicy()
 
@@ -107,12 +112,15 @@ func TestK8sRegistrationClient_GetActionPolicy(t *testing.T) {
 
 func TestK8sRegistrationClient_GetEntityMetadata(t *testing.T) {
 	conf := NewRegistrationClientConfig(stitching.UUID, 0, true)
-	reg := NewK8sRegistrationClient(conf)
+	targetConf := &configs.K8sTargetConfig{}
+	reg := NewK8sRegistrationClient(conf, targetConf)
 
 	//1. all the entity types
 	entities := []proto.EntityDTO_EntityType{
-		proto.EntityDTO_VIRTUAL_DATACENTER,
+		proto.EntityDTO_NAMESPACE,
+		proto.EntityDTO_WORKLOAD_CONTROLLER,
 		proto.EntityDTO_VIRTUAL_MACHINE,
+		proto.EntityDTO_CONTAINER_SPEC,
 		proto.EntityDTO_CONTAINER_POD,
 		proto.EntityDTO_CONTAINER,
 		proto.EntityDTO_APPLICATION,

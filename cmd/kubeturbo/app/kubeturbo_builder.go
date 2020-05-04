@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	agg "github.com/turbonomic/kubeturbo/pkg/discovery/worker/aggregation"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -99,6 +100,14 @@ type VMTServer struct {
 
 	// The Cluster API namespace
 	ClusterAPINamespace string
+
+	// Busybox image uri used for cpufreq getter job
+	BusyboxImage string
+
+	// Strategy to aggregate Container utilization data on ContainerSpec entity
+	containerUtilizationDataAggStrategy string
+	// Strategy to aggregate Container usage data on ContainerSpec entity
+	containerUsageDataAggStrategy string
 }
 
 // NewVMTServer creates a new VMTServer with default parameters
@@ -132,6 +141,9 @@ func (s *VMTServer) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.ValidationTimeout, "validation-timeout-sec", defaultValidationTimeout, "The validation timeout in seconds")
 	fs.StringSliceVar(&s.sccSupport, "scc-support", defaultSccSupport, "The SCC list allowed for executing pod actions, e.g., --scc-support=restricted,anyuid or --scc-support=* to allow all")
 	fs.StringVar(&s.ClusterAPINamespace, "cluster-api-namespace", "default", "The Cluster API namespace.")
+	fs.StringVar(&s.BusyboxImage, "busybox-image", "busybox", "The complete image uri used for fallback node cpu frequency getter job.")
+	fs.StringVar(&s.containerUtilizationDataAggStrategy, "cnt-utilization-data-agg-strategy", agg.DefaultContainerUtilizationDataAggStrategy, "Container utilization data aggregation strategy")
+	fs.StringVar(&s.containerUsageDataAggStrategy, "cnt-usage-data-agg-strategy", agg.DefaultContainerUsageDataAggStrategy, "Container usage data aggregation strategy")
 }
 
 // create an eventRecorder to send events to Kubernetes APIserver
@@ -169,17 +181,13 @@ func (s *VMTServer) createKubeClientOrDie(kubeConfig *restclient.Config) *kubern
 	return kubeClient
 }
 
-// createKubeletClientOrDie will create a kubelet client or exit the kubeturbo.
-// The forceSelfSignedCerts will be used as follows:
-// * If it is false, which means we are in the environment where we must use proper certificates, then we don't force self-signed certs.
-// * If it is true, then we use whatever flag we passed through the command line.
-func (s *VMTServer) createKubeletClientOrDie(kubeConfig *restclient.Config, forceSelfSignedCerts bool) *kubeclient.KubeletClient {
+func (s *VMTServer) createKubeletClientOrDie(kubeConfig *restclient.Config, fallbackClient *kubernetes.Clientset, busyboxImage string) *kubeclient.KubeletClient {
 	kubeletClient, err := kubeclient.NewKubeletConfig(kubeConfig).
 		WithPort(s.KubeletPort).
 		EnableHttps(s.EnableKubeletHttps).
-		ForceSelfSignedCerts(forceSelfSignedCerts && s.ForceSelfSignedCerts).
+		ForceSelfSignedCerts(s.ForceSelfSignedCerts).
 		// Timeout(to).
-		Create()
+		Create(fallbackClient, busyboxImage)
 	if err != nil {
 		glog.Errorf("Fatal error: failed to create kubeletClient: %v", err)
 		os.Exit(1)
@@ -220,8 +228,7 @@ func (s *VMTServer) checkFlag() error {
 // Run runs the specified VMTServer.  This should never exit.
 func (s *VMTServer) Run() {
 	if err := s.checkFlag(); err != nil {
-		glog.Errorf("check flag failed:%v. abort.", err.Error())
-		os.Exit(1)
+		glog.Fatalf("Check flag failed: %v. Abort.", err.Error())
 	}
 
 	kubeConfig := s.createKubeConfigOrDie()
@@ -231,12 +238,8 @@ func (s *VMTServer) Run() {
 
 	dynamicClient, err := dynamic.NewForConfig(kubeConfig)
 	if err != nil {
-		glog.Errorf("Failed to generate dynamic client for kubernetes target: %v", err)
-		os.Exit(1)
+		glog.Fatalf("Failed to generate dynamic client for kubernetes target: %v", err)
 	}
-
-	isOpenshift := checkServerVersion(kubeClient.DiscoveryClient.RESTClient())
-	glog.V(2).Info("Openshift cluster? ", isOpenshift)
 
 	util.K8sAPIDeploymentGV, err = discoverk8sAPIResourceGV(kubeClient, util.DeploymentResName)
 	if err != nil {
@@ -250,22 +253,22 @@ func (s *VMTServer) Run() {
 	}
 	glog.V(2).Infof("Using group version %v for k8s replicasets", util.K8sAPIReplicasetGV)
 
-	// Allow insecure connection only if it's not an Openshift cluster
-	// For Kubernetes distro, the secure connection to Kubelet will fail due to
-	// the certificate issue of 'doesn't contain any IP SANs'.
-	// See https://github.com/kubernetes/kubernetes/issues/59372
-	kubeletClient := s.createKubeletClientOrDie(kubeConfig, !isOpenshift)
-	caClient, err := clusterclient.NewForConfig(kubeConfig)
-	if err != nil {
-		glog.Errorf("Failed to generate correct TAP config: %v", err.Error())
-		caClient = nil
-	}
+	glog.V(3).Infof("Turbonomic config path is: %v", s.K8sTAPSpec)
 
-	glog.V(3).Infof("spec path is: %v", s.K8sTAPSpec)
 	k8sTAPSpec, err := kubeturbo.ParseK8sTAPServiceSpec(s.K8sTAPSpec, kubeConfig.Host)
 	if err != nil {
 		glog.Errorf("Failed to generate correct TAP config: %v", err.Error())
 		os.Exit(1)
+	}
+
+	// Collect target and probe info such as master host, server version, probe container image, etc
+	k8sTAPSpec.CollectK8sTargetAndProbeInfo(kubeConfig, kubeClient)
+
+	kubeletClient := s.createKubeletClientOrDie(kubeConfig, kubeClient, s.BusyboxImage)
+	caClient, err := clusterclient.NewForConfig(kubeConfig)
+	if err != nil {
+		glog.Errorf("Failed to generate correct TAP config: %v", err.Error())
+		caClient = nil
 	}
 
 	// Configuration for creating the Kubeturbo TAP service
@@ -282,20 +285,22 @@ func (s *VMTServer) Run() {
 		WithValidationTimeout(s.ValidationTimeout).
 		WithValidationWorkers(s.ValidationWorkers).
 		WithSccSupport(s.sccSupport).
-		WithCAPINamespace(s.ClusterAPINamespace)
+		WithCAPINamespace(s.ClusterAPINamespace).
+		WithContainerUtilizationDataAggStrategy(s.containerUtilizationDataAggStrategy).
+		WithContainerUsageDataAggStrategy(s.containerUsageDataAggStrategy)
 	glog.V(3).Infof("Finished creating turbo configuration: %+v", vmtConfig)
 
 	// The KubeTurbo TAP service
 	k8sTAPService, err := kubeturbo.NewKubernetesTAPService(vmtConfig)
 	if err != nil {
-		glog.Fatalf("Unexpected error while creating Kuberntes TAP service: %s", err)
+		glog.Fatalf("Unexpected error while creating Kubernetes TAP service: %s", err)
 	}
 
 	// The client for healthz, debug, and prometheus
 	go s.startHttp()
 	glog.V(2).Infof("No leader election")
 
-	glog.V(1).Infof("********** Start runnning Kubeturbo Service **********")
+	glog.V(1).Infof("********** Start running Kubeturbo Service **********")
 	// Disconnect from Turbo server when Kubeturbo is shutdown
 	handleExit(func() { k8sTAPService.DisconnectFromTurbo() })
 	k8sTAPService.ConnectToTurbo()
@@ -347,25 +352,6 @@ func handleExit(disconnectFunc disconnectFromTurboFunc) { // k8sTAPService *kube
 			disconnectFunc()
 		}
 	}()
-}
-
-// checkServerVersion checks and logs the server version and return if it is Openshift distro
-func checkServerVersion(restClient restclient.Interface) bool {
-	// Check Kubernetes version
-	bytes, err := restClient.Get().AbsPath("/version").DoRaw()
-	if err != nil {
-		glog.Errorf("Unable to get Kubernetes version info: %v", err)
-		return false
-	}
-	glog.V(2).Info("Kubernetes version: ", string(bytes))
-
-	// Check Openshift version, if exists
-	if bytes, err = restClient.Get().AbsPath("/version/openshift").DoRaw(); err == nil {
-		glog.V(2).Info("Openshift version: ", string(bytes))
-		return true
-	}
-
-	return false
 }
 
 func discoverk8sAPIResourceGV(client *kubernetes.Clientset, resourceName string) (schema.GroupVersion, error) {

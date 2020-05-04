@@ -2,12 +2,13 @@ package kubelet
 
 import (
 	"fmt"
-	api "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 	"math"
 	"math/rand"
 	"testing"
+
+	api "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
@@ -59,6 +60,13 @@ func createPodStat(podname string) *stats.PodStats {
 		Containers: containers,
 	}
 
+	fsStats := &stats.FsStats{}
+	capacity := uint64(rand.Intn(200) * 1e9)
+	used := uint64(rand.Intn(100) * 1e9)
+	fsStats.CapacityBytes = &capacity
+	fsStats.UsedBytes = &used
+	pod.EphemeralStorage = fsStats
+
 	return pod
 }
 
@@ -79,12 +87,12 @@ func checkPodMetrics(sink *metrics.EntityMetricSink, podMId string, pod *stats.P
 			for _, c := range pod.Containers {
 				expected += float64(*c.CPU.UsageNanoCores)
 			}
-			expected = expected / util.NanoToUnit
+			expected = util.MetricNanoToUnit(expected)
 		} else {
 			for _, c := range pod.Containers {
 				expected += float64(*c.Memory.WorkingSetBytes)
 			}
-			expected = expected / util.KilobytesToBytes
+			expected = util.Base2BytesToKilobytes(expected)
 		}
 
 		if math.Abs(value-expected) > myzero {
@@ -112,10 +120,10 @@ func checkContainerMetrics(sink *metrics.EntityMetricSink, containerMId string, 
 		expected := float64(0.0)
 		if res == metrics.CPU {
 			expected += float64(*container.CPU.UsageNanoCores)
-			expected = expected / util.NanoToUnit
+			expected = util.MetricNanoToUnit(expected)
 		} else {
 			expected += float64(*container.Memory.WorkingSetBytes)
-			expected = expected / util.KilobytesToBytes
+			expected = util.Base2BytesToKilobytes(expected)
 		}
 
 		if math.Abs(value-expected) > myzero {
@@ -142,10 +150,10 @@ func checkApplicationMetrics(sink *metrics.EntityMetricSink, appMId string, cont
 		expected := float64(0.0)
 		if res == metrics.CPU {
 			expected += float64(*container.CPU.UsageNanoCores)
-			expected = expected / util.NanoToUnit
+			expected = util.MetricNanoToUnit(expected)
 		} else {
 			expected += float64(*container.Memory.WorkingSetBytes)
-			expected = expected / util.KilobytesToBytes
+			expected = util.Base2BytesToKilobytes(expected)
 		}
 
 		if math.Abs(value-expected) > myzero {

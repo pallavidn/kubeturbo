@@ -2,16 +2,18 @@ package registration
 
 import (
 	"github.com/golang/glog"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
-
 	"github.com/turbonomic/turbo-go-sdk/pkg/builder"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 )
 
 const (
 	TargetIdentifierField string = "targetIdentifier"
-	Username              string = "username"
-	Password              string = "password"
+	MasterHost            string = "masterHost"
+	ServerVersion         string = "serverVersion"
+	Image                 string = "image"
+	ImageID               string = "imageID"
 	propertyId            string = "id"
 )
 
@@ -31,12 +33,14 @@ func NewRegistrationClientConfig(pType stitching.StitchingPropertyType, p int32,
 }
 
 type K8sRegistrationClient struct {
-	config *RegistrationConfig
+	config       *RegistrationConfig
+	targetConfig *configs.K8sTargetConfig
 }
 
-func NewK8sRegistrationClient(config *RegistrationConfig) *K8sRegistrationClient {
+func NewK8sRegistrationClient(config *RegistrationConfig, targetConfig *configs.K8sTargetConfig) *K8sRegistrationClient {
 	return &K8sRegistrationClient{
-		config: config,
+		config:       config,
+		targetConfig: targetConfig,
 	}
 }
 
@@ -50,25 +54,38 @@ func (rClient *K8sRegistrationClient) GetSupplyChainDefinition() []*proto.Templa
 	return supplyChain
 }
 
-func (rClient *K8sRegistrationClient) GetAccountDefinition() []*proto.AccountDefEntry {
-	var acctDefProps []*proto.AccountDefEntry
-
-	// target ID
-	targetIDAcctDefEntry := builder.NewAccountDefEntryBuilder(TargetIdentifierField, "Address",
-		"IP of the Kubernetes master", ".*", false, false).Create()
+func (rClient *K8sRegistrationClient) GetAccountDefinition() (acctDefProps []*proto.AccountDefEntry) {
+	// Target ID
+	targetIDAcctDefEntry := builder.NewAccountDefEntryBuilder(TargetIdentifierField, "Name",
+		"Name of the Kubernetes cluster", ".*", true, false).Create()
 	acctDefProps = append(acctDefProps, targetIDAcctDefEntry)
 
-	// username
-	usernameAcctDefEntry := builder.NewAccountDefEntryBuilder(Username, "Username",
-		"Username of the Kubernetes master", ".*", false, false).Create()
-	acctDefProps = append(acctDefProps, usernameAcctDefEntry)
+	// Do not register the following account definitions if no target has been defined
+	// in kubeturbo configuration. The target will be added manually.
+	if rClient.targetConfig.TargetIdentifier == "" {
+		return
+	}
 
-	// password
-	passwordAcctDefEntry := builder.NewAccountDefEntryBuilder(Password, "Password",
-		"Password of the Kubernetes master", ".*", false, true).Create()
-	acctDefProps = append(acctDefProps, passwordAcctDefEntry)
+	// Register the following account definitions if a target has been defined and added by kubeturbo.
+	// These fields are meant for read only to provide more information of the probe and target:
+	// Master Host
+	masterHostEntry := builder.NewAccountDefEntryBuilder(MasterHost, "Master Host",
+		"Address of the Kubernetes master", ".*", false, false).Create()
+	acctDefProps = append(acctDefProps, masterHostEntry)
+	// Kubernetes Server Version
+	serverVersion := builder.NewAccountDefEntryBuilder(ServerVersion, "Kubernetes Server Version",
+		"Version of the Kubernetes server", ".*", false, false).Create()
+	acctDefProps = append(acctDefProps, serverVersion)
+	// Probe Container Image
+	image := builder.NewAccountDefEntryBuilder(Image, "Kubeturbo Image",
+		"Container Image of Kubeturbo Probe", ".*", false, false).Create()
+	acctDefProps = append(acctDefProps, image)
+	// Probe Container Image ID
+	imageID := builder.NewAccountDefEntryBuilder(ImageID, "Kubeturbo Image ID",
+		"Container Image ID of Kubeturbo Probe", ".*", false, false).Create()
+	acctDefProps = append(acctDefProps, imageID)
 
-	return acctDefProps
+	return
 }
 
 func (rClient *K8sRegistrationClient) GetIdentifyingFields() string {
@@ -127,6 +144,7 @@ func (rClient *K8sRegistrationClient) GetActionPolicy() []*proto.ActionPolicyDTO
 	nodePolicy := make(map[proto.ActionItemDTO_ActionType]proto.ActionPolicyDTO_ActionCapability)
 	nodePolicy[proto.ActionItemDTO_PROVISION] = supported
 	nodePolicy[proto.ActionItemDTO_RIGHT_SIZE] = notSupported
+	nodePolicy[proto.ActionItemDTO_SCALE] = notSupported
 	nodePolicy[proto.ActionItemDTO_SUSPEND] = supported
 
 	rClient.addActionPolicy(ab, node, nodePolicy)
@@ -143,14 +161,14 @@ func (rClient *K8sRegistrationClient) addActionPolicy(ab *builder.ActionPolicyBu
 	}
 }
 
-func (rclient *K8sRegistrationClient) GetEntityMetadata() []*proto.EntityIdentityMetadata {
+func (rClient *K8sRegistrationClient) GetEntityMetadata() (result []*proto.EntityIdentityMetadata) {
 	glog.V(3).Infof("Begin to build EntityIdentityMetadata")
 
-	result := []*proto.EntityIdentityMetadata{}
-
 	entities := []proto.EntityDTO_EntityType{
-		proto.EntityDTO_VIRTUAL_DATACENTER,
+		proto.EntityDTO_NAMESPACE,
+		proto.EntityDTO_WORKLOAD_CONTROLLER,
 		proto.EntityDTO_VIRTUAL_MACHINE,
+		proto.EntityDTO_CONTAINER_SPEC,
 		proto.EntityDTO_CONTAINER_POD,
 		proto.EntityDTO_CONTAINER,
 		proto.EntityDTO_APPLICATION,
@@ -158,7 +176,7 @@ func (rclient *K8sRegistrationClient) GetEntityMetadata() []*proto.EntityIdentit
 	}
 
 	for _, etype := range entities {
-		meta := rclient.newIdMetaData(etype, []string{propertyId})
+		meta := rClient.newIdMetaData(etype, []string{propertyId})
 		result = append(result, meta)
 	}
 
@@ -167,8 +185,8 @@ func (rclient *K8sRegistrationClient) GetEntityMetadata() []*proto.EntityIdentit
 	return result
 }
 
-func (rclient *K8sRegistrationClient) newIdMetaData(etype proto.EntityDTO_EntityType, names []string) *proto.EntityIdentityMetadata {
-	data := []*proto.EntityIdentityMetadata_PropertyMetadata{}
+func (rClient *K8sRegistrationClient) newIdMetaData(etype proto.EntityDTO_EntityType, names []string) *proto.EntityIdentityMetadata {
+	var data []*proto.EntityIdentityMetadata_PropertyMetadata
 	for _, name := range names {
 		dat := &proto.EntityIdentityMetadata_PropertyMetadata{
 			Name: &name,
