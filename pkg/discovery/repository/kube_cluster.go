@@ -272,6 +272,7 @@ type ContainerSpec struct {
 	ControllerUID     string
 	ContainerSpecName string
 	ContainerSpecId   string
+	ContainerUIDs	 []string
 	// Container replicas number
 	ContainerReplicas int32
 	// Map from commodity type to list of commodity DTOs of this commodity type sold by container replicas of the
@@ -288,6 +289,10 @@ func NewContainerSpec(namespace, controllerUID, containerName, containerSpecId s
 		ContainerReplicas:    1,
 		ContainerCommodities: make(map[proto.CommodityDTO_CommodityType][]*proto.CommodityDTO),
 	}
+}
+
+func (spec *ContainerSpec) AddContainerUID(containerUID string) {
+	spec.ContainerUIDs = append(spec.ContainerUIDs, containerUID)
 }
 
 // K8s controller in the cluster

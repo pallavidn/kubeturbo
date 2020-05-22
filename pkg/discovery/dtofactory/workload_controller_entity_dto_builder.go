@@ -29,7 +29,7 @@ func (builder *workloadControllerDTOBuilder) BuildDTOs() ([]*proto.EntityDTO, er
 		// Id
 		workloadControllerId := kubeController.UID
 		entityDTOBuilder := sdkbuilder.NewEntityDTOBuilder(proto.EntityDTO_WORKLOAD_CONTROLLER, workloadControllerId)
-
+		glog.Infof("workloadControllerId --->%s:: %s", kubeController.Name, workloadControllerId)
 		// Display name
 		workloadControllerDisplayName := kubeController.Name
 		entityDTOBuilder.DisplayName(workloadControllerDisplayName)
@@ -62,6 +62,7 @@ func (builder *workloadControllerDTOBuilder) BuildDTOs() ([]*proto.EntityDTO, er
 		// The platform will translate this into the following relation:
 		// WorkloadController owns Containers
 		containerSpecsIds := builder.getContainerSpecIds(kubeController)
+		glog.Infof("workloadControllerId containerSpecsIds ---> [%v]", containerSpecsIds)
 		entityDTOBuilder.ConsistsOf(containerSpecsIds)
 
 		// Create WorkloadControllerData to store controller type data

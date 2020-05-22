@@ -63,11 +63,13 @@ func (worker *k8sContainerSpecDiscoveryWorker) getContainerDataAggregators(utili
 func (worker *k8sContainerSpecDiscoveryWorker) createContainerSpecMap(containerSpecList []*repository.ContainerSpec) map[string]*repository.ContainerSpec {
 	// Map from ContainerSpec ID to ContainerSpec object
 	containerSpecMap := make(map[string]*repository.ContainerSpec)
+	containers := make(map[string][]string)
 	for _, containerSpec := range containerSpecList {
 		containerSpecId := containerSpec.ContainerSpecId
 		existingContainerSpec, exists := containerSpecMap[containerSpecId]
 		if !exists {
 			containerSpecMap[containerSpecId] = containerSpec
+			containers[containerSpecId] = containerSpec.ContainerUIDs
 		} else {
 			// Append commodity DTOs of the same commodity type of container replicas
 			for commodityType, existingCommodities := range existingContainerSpec.ContainerCommodities {
@@ -81,6 +83,10 @@ func (worker *k8sContainerSpecDiscoveryWorker) createContainerSpecMap(containerS
 			}
 			// Increment number of container replicas
 			existingContainerSpec.ContainerReplicas++
+			containers[containerSpecId] = append(containers[containerSpecId], containerSpec.ContainerUIDs...)
+			existingContainerSpec.ContainerUIDs = append(existingContainerSpec.ContainerUIDs,
+															containerSpec.ContainerUIDs...)
+
 		}
 	}
 	for containerSpecId, containerSpec := range containerSpecMap {

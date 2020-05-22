@@ -2,6 +2,9 @@ package discovery
 
 import (
 	"fmt"
+	//protobuf "github.com/golang/protobuf/proto"
+
+	//"github.com/turbonomic/kubeturbo/vendor/github.com/golang/protobuf/proto"
 	"strings"
 	"time"
 
@@ -198,12 +201,18 @@ func (dc *K8sDiscoveryClient) Discover(
 	}
 
 	currentTime := time.Now()
-	newDiscoveryResultDTOs, groupDTOs, err := dc.discoverWithNewFramework(targetID)
+	newDiscoveryResultDTOs, groupDTOs, actionSpecDTOs, err := dc.discoverWithNewFramework(targetID)
 	if err != nil {
 		glog.Errorf("Failed to discover kubernetes cluster: %v", err)
 		return
 	}
 
+	discoveryResponse = &proto.DiscoveryResponse{
+		//DiscoveredGroup:  groupDTOs,
+		//EntityDTO:        newDiscoveryResultDTOs,
+		ActionMergeSpecs: actionSpecDTOs,
+	}
+	//glog.Infof("SPEC DTO: %++v", protobuf.MarshalTextString(discoveryResponse))
 	newFrameworkDiscTime := time.Now().Sub(currentTime).Seconds()
 
 	discoveryResponse.DiscoveredGroup = groupDTOs
@@ -211,17 +220,18 @@ func (dc *K8sDiscoveryClient) Discover(
 
 	glog.V(2).Infof("Successfully discovered kubernetes cluster in %.3f seconds", newFrameworkDiscTime)
 
+
 	return
 }
 
 /*
 	The actual discovery work is done here.
 */
-func (dc *K8sDiscoveryClient) discoverWithNewFramework(targetID string) ([]*proto.EntityDTO, []*proto.GroupDTO, error) {
+func (dc *K8sDiscoveryClient) discoverWithNewFramework(targetID string) ([]*proto.EntityDTO, []*proto.GroupDTO, []*proto.ActionMergeSpec, error) {
 	// CREATE CLUSTER, NODES, NAMESPACES, QUOTAS, SERVICES HERE
 	kubeCluster, err := dc.clusterProcessor.DiscoverCluster()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to process cluster: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to process cluster: %v", err)
 	}
 	clusterSummary := repository.CreateClusterSummary(kubeCluster)
 
@@ -233,7 +243,8 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework(targetID string) ([]*prot
 	// Discover pods and create DTOs for nodes, namespaces, controllers, pods, containers, application.
 	// Collect the kubePod, kubeNamespace metrics, groups and kubeControllers from all the discovery workers
 	workerCount := dc.dispatcher.Dispatch(nodes, clusterSummary)
-	entityDTOs, podEntitiesMap, namespaceMetricsList, entityGroupList, kubeControllerList, containerSpecs := dc.resultCollector.Collect(workerCount)
+	entityDTOs, podEntitiesMap, namespaceMetricsList, entityGroupList, kubeControllerList, containerSpecsList :=
+		dc.resultCollector.Collect(workerCount)
 
 	// Namespace discovery worker to create namespace DTOs
 	stitchType := dc.config.probeConfig.StitchingPropertyType
@@ -260,7 +271,7 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework(targetID string) ([]*prot
 	// replicas. ContainerSpec is an entity type which represents a certain type of container replicas deployed by a
 	// K8s controller.
 	containerSpecDiscoveryWorker := worker.NewK8sContainerSpecDiscoveryWorker()
-	containerSpecDtos, err := containerSpecDiscoveryWorker.Do(containerSpecs, dc.config.containerUtilizationDataAggStrategy,
+	containerSpecDtos, err := containerSpecDiscoveryWorker.Do(containerSpecsList, dc.config.containerUtilizationDataAggStrategy,
 		dc.config.containerUsageDataAggStrategy)
 	if err != nil {
 		glog.Errorf("Failed to discover ContainerSpecs from current Kubernetes cluster with the new discovery framework: %s", err)
@@ -327,5 +338,10 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework(targetID string) ([]*prot
 	}
 
 	groupDTOs = append(groupDTOs, nodeAntiAffinityGroupDTOs...)
-	return entityDTOs, groupDTOs, nil
+
+	// Discovery worker for creating Group DTOs
+	actionSpecWorker := worker.Newk8sActionSpecWorker(clusterSummary, targetID)
+	actionSpecDTOs, _ := actionSpecWorker.Do(containerSpecsList)
+
+	return entityDTOs, groupDTOs, actionSpecDTOs, nil
 }
